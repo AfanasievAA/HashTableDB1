@@ -41,13 +41,13 @@
 
 ```powershell
 git clone https://github.com/<your-user>/HashTableDB1.git
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+Import-Module ./HashTableDB1/HashTableDB1.ps1
 ```
 
 ### Quick start
 
 ```powershell
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+Import-Module ./HashTableDB1/HashTableDB1.ps1
 
 # Open (or create) a database file
 $db = [HashTableDB1]::new("$PWD/data.json")
@@ -152,13 +152,13 @@ MIT — see [LICENSE](LICENSE).
 
 ```powershell
 git clone https://github.com/<your-user>/HashTableDB1.git
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+Import-Module ./HashTableDB1/HashTableDB1.ps1
 ```
 
 ### Быстрый старт
 
 ```powershell
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+Import-Module ./HashTableDB1/HashTableDB1.ps1
 
 # Открыть или создать файл базы
 $db = [HashTableDB1]::new("$PWD/data.json")
