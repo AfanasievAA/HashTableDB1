@@ -8,7 +8,7 @@
     3. Sequentially tests:
        - Add / Remove / AddListUnique / RemoveListUnique
        - Consolidate (Normal & High Load)
-       - SaveToXML / LoadFromXML (Sync & Async)
+       - SaveToDisk / LoadFromDisk (Sync & Async)
        - Isolated Add/Get/Remove performance
        - Bulk Read performance
        - Backup rotation (NumOfDbBackupsToKeep)
@@ -29,6 +29,7 @@
  $projectRoot = Resolve-Path "$($projectSource)"
  $projectTmp = Join-Path $projectRoot "tmp"
  $ClassFile = Join-Path $projectSource "HashtableDB1-Class.ps1"
+ $StorageFormatToTest = 'xml'
 if (-not (Test-Path $ClassFile)) {
     Write-Error "Class file not found: $ClassFile"
     exit 1
@@ -126,6 +127,7 @@ function New-TestDB {
     $db.DatabaseFileName     = 'TestDB'
     $db.NumOfDbBackupsToKeep = $BackupCount
     $db.EnableTransactionLog = $true
+    $db.StorageFormat = $StorageFormatToTest
     $db
 }
 
@@ -147,6 +149,14 @@ function Compare-DbValues {
         Write-Warning "Compare-DbValues: null mismatch at '$Path' (E=$($null -eq $Expected) A=$($null -eq $Actual))"
         return $false
     }
+    # Normalize CLIXML-deserialized wrappers: in Xml mode collections come back as PSObject instances
+    # wrapping the collection. GetType() forwards to the wrapped object (so it prints "ArrayList"),
+    # but the -is classification below sees the wrapper and the pscustomobject branch marks it
+    # dict-like, while the pristine snapshot value is list-like - a bogus "dict/scalar" mismatch.
+    # Unwrapping via BaseObject makes both sides classify identically; raw values unwrap to
+    # themselves, so Json-mode behavior is unchanged.
+    $Expected = $Expected.PSObject.BaseObject
+    $Actual = $Actual.PSObject.BaseObject
     # Dictionary-like: IDictionary (hashtable) or PSCustomObject on either side
     $eIsDict = $Expected -is [System.Collections.IDictionary] -or $Expected -is [pscustomobject]
     $aIsDict = $Actual -is [System.Collections.IDictionary] -or $Actual -is [pscustomobject]
@@ -260,7 +270,7 @@ function Wait-ForAsyncResult {
         Start-Sleep -Milliseconds 250
     }
 }
-
+Write-Host "Selected storage format: $StorageFormatToTest"
 # -------------------------------------------------
 # 2. Test logic
 # -------------------------------------------------
@@ -301,7 +311,7 @@ if ($db1.Get($uniqKey).Count -ne 1) { Write-Host "FAIL: RemoveListUnique broken"
 Write-Host "PASS: Test 1 completed" -ForegroundColor Green
 
 # 2.2 Test 2 - Sync Save / Load with Mixed PowerShell Types
-Write-Host "`n=== Test 2 - SaveToXML / LoadFromXML (Mixed Types) ===" -ForegroundColor Cyan
+Write-Host "`n=== Test 2 - SaveToDisk / LoadFromDisk (Mixed Types) ===" -ForegroundColor Cyan
  $folder2 = Join-Path $BasePath '02_SyncSaveLoad'
 New-Item -ItemType Directory -Path $folder2 | Out-Null
  $db2 = New-TestDB -Folder $folder2 -BackupCount 2
@@ -352,13 +362,13 @@ foreach ($k in $mixedTypes.Keys) { $db2.Add($k, $mixedTypes[$k]) }
  $db2.SaveToDisk()
  $sw.Stop()
  $memAfter = Get-CurrentMemoryMB
-Add-TestMetric -TestName "Test 2" -Operation "SaveToXML" -Context "Synchronously saves the current database state (main, updates, deletes) into JSON files including records with various PowerShell data types (strings, numerics, DateTime, TimeSpan, Guid, char, byte, arrays, ArrayList, hashtables, PSCustomObjects, nested structures) to test standard persistence and serialization fidelity." -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
+Add-TestMetric -TestName "Test 2" -Operation "SaveToDisk" -Context "Synchronously saves the current database state (main, updates, deletes) into JSON files including records with various PowerShell data types (strings, numerics, DateTime, TimeSpan, Guid, char, byte, arrays, ArrayList, hashtables, PSCustomObjects, nested structures) to test standard persistence and serialization fidelity. Format for all save/load tests: $StorageFormatToTest" -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
 
  $db2b = New-TestDB -Folder $folder2 -BackupCount 2
  $sw.Restart()
  $ok = $db2b.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 2" -Operation "LoadFromXML" -Context "Synchronously loads the database from the previously saved JSON files and verifies data integrity and exact type preservation against an in-memory snapshot." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 2" -Operation "LoadFromDisk" -Context "Synchronously loads the database from the previously saved JSON files and verifies data integrity and exact type preservation against an in-memory snapshot." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok){"OK"}else{"FAIL"})
 
 # Strict type validation: ensure PSObject and other native types are preserved exactly as they were before serialization
  $strictTypeOk = $true
@@ -388,7 +398,13 @@ if ($loadedDecimal -isnot [decimal]) {
     $strictTypeOk = $false
 }
  $loadedEmptyArray = $db2b.Get('mt_EmptyArray')
-if ($null -eq $loadedEmptyArray -or -not ($loadedEmptyArray -is [System.Array]) -or @($loadedEmptyArray).Count -ne 0) {
+# Format-agnostic: the container type of an empty array is format-dependent (Json -> object[],
+# CLIXML -> ArrayList, possibly PSObject-wrapped). The guarded regression is "the empty array
+# survived as a non-null empty collection and did not collapse to $null" - so check exactly that.
+# NOTE: no intermediate variable - an 'if' expression assignment streams its output through the
+# pipeline, which enumerates an empty collection into zero items and collapses it to $null (the
+# same gotcha RestoreClassesScriptBlock guards against with its comma-wrapped return).
+if ($null -eq $loadedEmptyArray -or @($loadedEmptyArray).Count -ne 0) {
     Write-Host "FAIL: mt_EmptyArray lost. Expected empty array, got $(if ($null -ne $loadedEmptyArray) { $loadedEmptyArray.GetType().Name } else { 'null' })" -ForegroundColor Red
     $strictTypeOk = $false
 }
@@ -404,7 +420,7 @@ if ($loadedEmptyHash -isnot [hashtable] -or $loadedEmptyHash.Count -ne 0) {
 if (-not $ok -or -not $typeTestOk -or -not $strictTypeOk) { Write-Host "FAIL: Sync Save/Load mismatch on mixed types or strict type violation" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Sync Save/Load with Mixed Types OK" -ForegroundColor Green }
 
 # 2.3 Test 3 - Async Save vs Sync Save
-Write-Host "`n=== Test 3 - SaveToXMLAsync vs SaveToXML ===" -ForegroundColor Cyan
+Write-Host "`n=== Test 3 - SaveToDiskAsync vs SaveToDisk ===" -ForegroundColor Cyan
  $folder3 = Join-Path $BasePath '03_AsyncSave'
 New-Item -ItemType Directory -Path $folder3 | Out-Null
  $db3 = New-TestDB -Folder $folder3 -BackupCount 2
@@ -418,13 +434,13 @@ foreach ($k in $keysToRemove) { $db3.Remove($k) }
  $db3.SaveToDiskAsync()
 Wait-ForAsyncResult $db3
  $sw.Stop()
-Add-TestMetric -TestName "Test 3" -Operation "SaveToXMLAsync + Wait" -Context "Initiates an asynchronous save operation to XML files and blocks until completion using a custom wait mechanism, testing async persistence." -ElapsedSeconds $sw.Elapsed.TotalSeconds
+Add-TestMetric -TestName "Test 3" -Operation "SaveToDiskAsync + Wait" -Context "Initiates an asynchronous save operation to $($StorageFormatToTest) files and blocks until completion using a custom wait mechanism, testing async persistence." -ElapsedSeconds $sw.Elapsed.TotalSeconds
 
  $db3Loaded = New-TestDB -Folder $folder3 -BackupCount 2
  $sw.Restart()
  $ok = $db3Loaded.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 3" -Operation "LoadFromXML" -Context "Synchronously loads the database saved asynchronously to verify that async operations produce correct XML files." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 3" -Operation "LoadFromDisk" -Context "Synchronously loads the database saved asynchronously to verify that async operations produce correct $($StorageFormatToTest) files." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok){"OK"}else{"FAIL"})
 if (-not $ok -or -not (Compare-DbValues -Expected $snapshotAsync -Actual $db3Loaded.Clone() -Path 'Test3.')) { Write-Host "FAIL: Async save data mismatch" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Async Save produced correct data" -ForegroundColor Green }
 
 # 2.4 Test 4 - Consolidate + backup-rotation
@@ -449,7 +465,7 @@ Add-TestMetric -TestName "Test 4" -Operation "Consolidate" -Context "Merges upda
  $sw.Restart()
  $db4.SaveToDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 4" -Operation "SaveToXML (post-consolidate)" -Context "Synchronously saves the database after consolidation to verify that backup files are correctly created in the OLD folder and limits are respected." -ElapsedSeconds $sw.Elapsed.TotalSeconds
+Add-TestMetric -TestName "Test 4" -Operation "SaveToDisk (post-consolidate)" -Context "Synchronously saves the database after consolidation to verify that backup files are correctly created in the OLD folder and limits are respected." -ElapsedSeconds $sw.Elapsed.TotalSeconds
 Write-Host "PASS: Consolidate & backup rotation OK" -ForegroundColor Green
 
 # 2.5 Test 5 - Parallel async-save (Mutex)
@@ -463,14 +479,14 @@ foreach ($item in $Script:Data15) { $db5.Add($item.Key, $item.Value) }
  $db5.SaveToDiskAsync()
 Wait-ForAsyncResult $db5 -TimeoutSec 30
  $sw.Stop()
-Add-TestMetric -TestName "Test 5" -Operation "SaveToXMLAsync #1 + Wait" -Context "Triggers the first asynchronous save operation and waits for it to complete, testing basic async Mutex acquisition and release." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db5.AsyncResults['Success']){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 5" -Operation "SaveToDiskAsync #1 + Wait" -Context "Triggers the first asynchronous save operation and waits for it to complete, testing basic async Mutex acquisition and release." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db5.AsyncResults['Success']){"OK"}else{"FAIL"})
  $db5.AsyncResults.Clear()
 
  $sw.Restart()
  $db5.SaveToDiskAsync()
 Wait-ForAsyncResult $db5 -TimeoutSec 30
  $sw.Stop()
-Add-TestMetric -TestName "Test 5" -Operation "SaveToXMLAsync #2 + Wait" -Context "Triggers a second sequential asynchronous save operation to ensure the Mutex was properly released and the DB can save again." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db5.AsyncResults['Success']){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 5" -Operation "SaveToDiskAsync #2 + Wait" -Context "Triggers a second sequential asynchronous save operation to ensure the Mutex was properly released and the DB can save again." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db5.AsyncResults['Success']){"OK"}else{"FAIL"})
 Write-Host "PASS: Parallel async saves completed" -ForegroundColor Green
 
 # 2.6 Test 6 - Isolated Performance (Pure Add/Get/Remove)
@@ -544,7 +560,7 @@ Add-TestMetric -TestName "Test 8" -Operation "Consolidate (100k base, 50k del, 1
  $sw.Restart()
  $db8.SaveToDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 8" -Operation "SaveToXML (post-stress)" -Context "Synchronously saves the heavily fragmented and consolidated database to XML to measure serialization performance under stress." -ElapsedSeconds $sw.Elapsed.TotalSeconds
+Add-TestMetric -TestName "Test 8" -Operation "SaveToDisk (post-stress)" -Context "Synchronously saves the heavily fragmented and consolidated database to $($StorageFormatToTest) to measure serialization performance under stress." -ElapsedSeconds $sw.Elapsed.TotalSeconds
 
  $expectedCount = 100000 - 50000 + 10000
  $db8Loaded = New-TestDB -Folder $folder8 -BackupCount 1
@@ -569,13 +585,13 @@ Add-TestMetric -TestName "Test 9" -Operation "Add 120k records" -Context "Adds 1
  $db9.SaveToDisk()
  $sw.Stop()
  $memAfter = Get-CurrentMemoryMB
-Add-TestMetric -TestName "Test 9" -Operation "SaveToXML" -Context "Synchronously saves a large 120k-record dataset to XML to measure serialization performance under heavy load." -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
+Add-TestMetric -TestName "Test 9" -Operation "SaveToDisk" -Context "Synchronously saves a large 120k-record dataset to $($StorageFormatToTest) to measure serialization performance under heavy load." -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
 
  $sw.Restart()
  $db9Loaded = New-TestDB -Folder $folder9 -BackupCount 1
  $loaded = $db9Loaded.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 9" -Operation "LoadFromXML" -Context "Synchronously loads the large dataset from XML to verify deserialization performance and data integrity." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 9" -Operation "LoadFromDisk" -Context "Synchronously loads the large dataset from $($StorageFormatToTest) to verify deserialization performance and data integrity." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
 if (-not $loaded -or $db9Loaded.MergedHT.Count -ne 120000) { Write-Host "FAIL: Large dataset load failed" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Large dataset completed successfully" -ForegroundColor Green }
 
 # 2.10 Test 10 - Auto-consolidate logic
@@ -593,13 +609,13 @@ foreach ($item in ($Script:Data120k[100000..100039])) { $db10.Add($item.Key, $it
  $sw.Restart()
  $db10.SaveToDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 10" -Operation "SaveToXML #2 (auto-consolidate)" -Context "Synchronously saves the database again, triggering the internal auto-consolidate logic based on update thresholds." -ElapsedSeconds $sw.Elapsed.TotalSeconds
+Add-TestMetric -TestName "Test 10" -Operation "SaveToDisk #2 (auto-consolidate)" -Context "Synchronously saves the database again, triggering the internal auto-consolidate logic based on update thresholds." -ElapsedSeconds $sw.Elapsed.TotalSeconds
 
  $sw.Restart()
  $db10Loaded = New-TestDB -Folder $folder10 -BackupCount 1
  $loaded = $db10Loaded.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 10" -Operation "LoadFromXML" -Context "Synchronously loads the database to verify that auto-consolidate preserved all records correctly." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 10" -Operation "LoadFromDisk" -Context "Synchronously loads the database to verify that auto-consolidate preserved all records correctly." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
 if ($loaded -and $db10Loaded.MergedHT.Count -eq ($mainCountBefore + 40)) { Write-Host "PASS: Auto-consolidate logic works" -ForegroundColor Green } else { Write-Host "FAIL: Auto-consolidate data mismatch" -ForegroundColor Red; $AllOk = $false }
 
 # 2.11 Test 11 - Database parameters persistence
@@ -620,7 +636,7 @@ foreach ($item in $Script:Data10) { $db11.Add($item.Key, $item.Value) }
  $db11Loaded = New-TestDB -Folder $folder11 -BackupCount 1
  $loaded = $db11Loaded.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 11" -Operation "LoadFromXML" -Context "Synchronously loads the database to verify that custom parameters and nested configurations are correctly deserialized." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 11" -Operation "LoadFromDisk" -Context "Synchronously loads the database to verify that custom parameters and nested configurations are correctly deserialized." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($loaded){"OK"}else{"FAIL"})
 if (-not $loaded -or $db11Loaded.DatabaseParamsHT['CustomConfig']['Setting2'] -ne 42) { Write-Host "FAIL: Nested param not persisted" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Database parameters persisted correctly" -ForegroundColor Green }
 
 # 2.12 Test 12 - Async/Sync Load coordination
@@ -638,12 +654,12 @@ foreach ($item in $Script:Data25) { $db12.Add($item.Key, $item.Value) }
  $db12Async.LoadFromDiskAsync()
 Wait-ForAsyncResult $db12Async -TimeoutSec 30
  $sw.Stop()
-Add-TestMetric -TestName "Test 12.1" -Operation "LoadFromXMLAsync + Wait" -Context "Initiates an asynchronous load operation and waits for completion to test background data retrieval." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db12Async.AsyncResults['Success']){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 12.1" -Operation "LoadFromDiskAsync + Wait" -Context "Initiates an asynchronous load operation and waits for completion to test background data retrieval." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db12Async.AsyncResults['Success']){"OK"}else{"FAIL"})
 
  $sw.Restart()
  $syncOk = $db12Async.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 12.2" -Operation "LoadFromXML (no-op)" -Context "Triggers a synchronous load immediately after an async load to verify the no-op optimization (skipping reload if timestamps are unchanged)." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($syncOk){"FAIL"}else{"OK"})
+Add-TestMetric -TestName "Test 12.2" -Operation "LoadFromDisk (no-op)" -Context "Triggers a synchronous load immediately after an async load to verify the no-op optimization (skipping reload if timestamps are unchanged)." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($syncOk){"FAIL"}else{"OK"})
 
 Start-Sleep -Milliseconds 150
  $db12Mod = New-TestDB -Folder $folder12 -BackupCount 1
@@ -653,7 +669,7 @@ Start-Sleep -Milliseconds 150
  $sw.Restart()
  $changed = $db12Async.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 12.3" -Operation "LoadFromXML (after mod)" -Context "Triggers a synchronous load after modifying the underlying XML files to verify the system correctly detects changes and reloads data." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($changed){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 12.3" -Operation "LoadFromDisk (after mod)" -Context "Triggers a synchronous load after modifying the underlying $($StorageFormatToTest)L files to verify the system correctly detects changes and reloads data." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($changed){"OK"}else{"FAIL"})
 Write-Host "PASS: Async/Sync Load coordination OK" -ForegroundColor Green
 
 # 2.13 Test 13 - Concurrent async saves with large dataset
@@ -671,7 +687,7 @@ Add-TestMetric -TestName "Test 13" -Operation "Add 120k records" -Context "Adds 
  $db13.SaveToDiskAsync()
  $db13.SaveToDiskAsync()
  $sw.Stop()
-Add-TestMetric -TestName "Test 13" -Operation "SaveToXMLAsync x2 (start)" -Context "Triggers two asynchronous save operations in rapid succession to test Mutex queueing and background serialization of a massive dataset." -ElapsedSeconds $sw.Elapsed.TotalSeconds
+Add-TestMetric -TestName "Test 13" -Operation "SaveToDiskAsync x2 (start)" -Context "Triggers two asynchronous save operations in rapid succession to test Mutex queueing and background serialization of a massive dataset." -ElapsedSeconds $sw.Elapsed.TotalSeconds
 
  $initialSnapshot = $db13.Clone()
  $keysToModify = $db13.GetAllKeys()[0..4]
@@ -686,14 +702,14 @@ Add-TestMetric -TestName "Test 13" -Operation "Modify 5 records" -Context "Modif
  $modifiedSnapshot = $db13.Clone()
 Wait-ForAsyncResult $db13 -TimeoutSec 60
  $sw.Stop()
-Add-TestMetric -TestName "Test 13" -Operation "SaveToXMLAsync #3 + Wait" -Context "Triggers a third asynchronous save to capture the modifications and waits for completion to verify Mutex handling of queued operations." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db13.AsyncResults['Success']){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 13" -Operation "SaveToDiskAsync #3 + Wait" -Context "Triggers a third asynchronous save to capture the modifications and waits for completion to verify Mutex handling of queued operations." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db13.AsyncResults['Success']){"OK"}else{"FAIL"})
 
  $verifierDb = New-TestDB -Folder $folder13 -BackupCount 0
  $sw.Restart()
  $verifierDb.LoadFromDiskAsync()
  $null = $verifierDb.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 13" -Operation "Verify LoadFromXMLAsync+Sync" -Context "Performs an async load followed immediately by a sync load to verify data retrieval of the large dataset without errors." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($verifierDb.ErrorLevel -eq 0){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 13" -Operation "Verify LoadFromDiskAsync+Sync" -Context "Performs an async load followed immediately by a sync load to verify data retrieval of the large dataset without errors." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($verifierDb.ErrorLevel -eq 0){"OK"}else{"FAIL"})
 
  $allModificationsCorrect = $true
 foreach ($key in $keysToModify) {
@@ -703,7 +719,12 @@ if ($db13.AsyncResults['Success'] -and $allModificationsCorrect) { Write-Host "P
  $db13.AsyncResults.Clear()
 
 # 2.14 Test 14 - Type fidelity round-trip ('~i' int keys, '~D' DateTime, '~S' date-strings, '~C' PS classes)
-Write-Host "`n=== Test 14 - Type fidelity round-trip ===" -ForegroundColor Cyan
+# Json-only: the '~i'/'~D'/'~S'/'~C' markers and PS-class rehydration do not exist in the CLIXML
+# compatibility mode (class instances come back as Deserialized.* property bags - accepted trade-off)
+if ($StorageFormatToTest -ne 'Json') {
+    Write-Host "`n=== Test 14 - Type fidelity round-trip ===" -ForegroundColor Cyan
+    Write-Host "SKIP: type-fidelity markers are a Json-format feature (StorageFormat=$StorageFormatToTest)" -ForegroundColor Yellow
+} else {
  $folder14 = Join-Path $BasePath '14_TypeFidelity'
 New-Item -ItemType Directory -Path $folder14 | Out-Null
  $db14 = New-TestDB -Folder $folder14 -BackupCount 1
@@ -737,13 +758,13 @@ New-Item -ItemType Directory -Path $folder14 | Out-Null
  $db14.SaveToDisk()
  $sw.Stop()
  $memAfter = Get-CurrentMemoryMB
-Add-TestMetric -TestName "Test 14" -Operation "SaveToXML (typed data)" -Context "Synchronously saves strict-type payloads: int-keyed hashtable, DateTime (Utc/Local), an O-shaped date string and PowerShell class instances (incl. nested class and empty array) to test '~i'/'~D'/'~S'/'~C' marker serialization." -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
+Add-TestMetric -TestName "Test 14" -Operation "SaveToDisk (typed data)" -Context "Synchronously saves strict-type payloads: int-keyed hashtable, DateTime (Utc/Local), an O-shaped date string and PowerShell class instances (incl. nested class and empty array) to test '~i'/'~D'/'~S'/'~C' marker serialization." -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
 
  $db14b = New-TestDB -Folder $folder14 -BackupCount 1
  $sw.Restart()
  $ok14 = $db14b.LoadFromDisk()
  $sw.Stop()
-Add-TestMetric -TestName "Test 14" -Operation "LoadFromXML (typed data)" -Context "Synchronously loads the typed dataset and validates strict type restoration: Int32 hashtable keys, DateTime with exact ticks and Kind, protected date-shaped strings and rehydrated class instances." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok14){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 14" -Operation "LoadFromDisk (typed data)" -Context "Synchronously loads the typed dataset and validates strict type restoration: Int32 hashtable keys, DateTime with exact ticks and Kind, protected date-shaped strings and rehydrated class instances." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($ok14){"OK"}else{"FAIL"})
 
  $typeFidelityOk = $true
  $loadedHT14 = $db14b.Get('tf_IntKeyedHT')
@@ -804,13 +825,14 @@ if ($loadedNested14 -isnot [hashtable] -or $null -eq $loadedNested14.Inner -or @
  $db14c.LoadFromDiskAsync()
 Wait-ForAsyncResult $db14c -TimeoutSec 30
  $sw.Stop()
-Add-TestMetric -TestName "Test 14" -Operation "LoadFromXMLAsync (typed data)" -Context "Loads the typed dataset asynchronously and verifies that the event-action restore path rehydrates class instances and type markers identically to the synchronous path." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db14c.AsyncResults['Success']){"OK"}else{"FAIL"})
+Add-TestMetric -TestName "Test 14" -Operation "LoadFromDiskAsync (typed data)" -Context "Loads the typed dataset asynchronously and verifies that the event-action restore path rehydrates class instances and type markers identically to the synchronous path." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($db14c.AsyncResults['Success']){"OK"}else{"FAIL"})
 if ($db14c.Get('tf_ClassInstance') -isnot [TstCertContainer] -or $db14c.Get('tf_DateTimeUtc') -isnot [datetime] -or $db14c.Get('tf_IntKeyedHT')[789] -ne 'cert_C') {
     Write-Host "FAIL: Async load did not rehydrate types in the event action" -ForegroundColor Red
     $typeFidelityOk = $false
 }
 
 if (-not $ok14 -or -not $typeFidelityOk) { Write-Host "FAIL: Type fidelity round-trip failed" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Type fidelity round-trip OK" -ForegroundColor Green }
+}
 
 # -------------------------------------------------
 # 3. Summary & Save Metrics

@@ -1,7 +1,7 @@
 # HashTableDB1
 
 <p align="center">
-  <b>Persistent, thread-safe key–value database for PowerShell</b><br>
+  <b>Persistent, thread-safe key-value database for PowerShell</b><br>
   <i>JSON storage &bull; asynchronous I/O &bull; exact type fidelity &bull; transaction log &bull; zero dependencies</i>
 </p>
 
@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell" alt="PowerShell 7+">
   <img src="https://img.shields.io/badge/dependencies-none-success" alt="No dependencies">
   <img src="https://img.shields.io/badge/tests-14%2F14%20passed-brightgreen" alt="Tests">
-  <img src="https://img.shields.io/badge/storage-JSON-informational" alt="JSON storage">
+  <img src="https://img.shields.io/badge/storage-JSON%20%2F%20CLIXML-informational" alt="JSON / CLIXML storage">
   <img src="https://img.shields.io/badge/TxLog-optional-blueviolet" alt="Transaction log">
 </p>
 
@@ -22,18 +22,19 @@
 
 ### Overview
 
-**HashTableDB1** is a lightweight, dependency-free, persistent key–value store written in pure PowerShell 7+. It saves data to a JSON file, supports asynchronous flushing and loading, and preserves exact .NET types via an internal type-tagging mechanism. It also ships with an optional append-only **transaction log (TxLog)** for replica synchronisation and point-in-time recovery.
+**HashTableDB1** is a lightweight, dependency-free, persistent key-value store written in pure PowerShell 7+. It saves data to JSON files (or classic CLIXML XML in compatibility mode), supports asynchronous flushing and loading, and preserves exact .NET types via an internal type-tagging mechanism. It also ships with an optional append-only **transaction log (TxLog)** for replica synchronisation and point-in-time recovery.
 
 ### Features
 
-- **Persistent** — data survives process restarts (JSON on disk).
-- **Thread-safe** — synchronized access via `[System.Threading.Monitor]` and `ReaderWriterLockSlim`.
-- **Asynchronous I/O** — three independent background subsystems (save, load, TxLog) run inside persistent `RunspacePool(1,1)` instances and never block the caller.
-- **Type fidelity** — integers, longs, doubles, booleans, dates, GUIDs, arrays and nested hashtables round-trip exactly.
-- **Transaction log** — optional append-only journal of every `Add` / `Remove` with `FileTimeUtc` ticks.
-- **Backup rotation** — timestamped `.old` backups with configurable retention.
-- **Zero dependencies** — pure PowerShell 7+, no modules required.
-- **Simple API** — `Add`, `Remove`, `Get`, `ContainsKey`, `GetAllKeys`, `GetAllValues`, `SaveToDisk`, `SaveToDiskAsync`, `LoadFromDisk`, `LoadFromDiskAsync`, `CompactDatabase`, `Dispose`.
+- **Persistent** - data survives process restarts (JSON on disk).
+- **Thread-safe** - lock-free reads over `ConcurrentDictionary`; writes use CAS retry loops, TxLog state is guarded by `[System.Threading.Monitor]`.
+- **Asynchronous I/O** - three independent background subsystems (save, load, TxLog) run inside persistent `RunspacePool(1,1)` instances and never block the caller.
+- **Type fidelity** - integers, longs, doubles, booleans, dates, GUIDs, arrays and nested hashtables round-trip exactly.
+- **Transaction log** - optional append-only journal of every `Add` / `Remove` with `FileTimeUtc` ticks.
+- **Backup rotation** - timestamped `.old` backups with configurable retention.
+- **CLIXML compatibility mode** - `StorageFormat = 'Xml'` writes classic `PSSerializer` XML for legacy consumers; files of the other format are auto-migrated (archived to `OLD/`), so the folder always holds exactly one format.
+- **Zero dependencies** - pure PowerShell 7+, no modules required.
+- **Simple API** - `Add`, `Remove`, `Get`, `ContainsKey`, `GetAllKeys`, `GetAllValues`, `SaveToDisk`, `SaveToDiskAsync`, `LoadFromDisk`, `LoadFromDiskAsync`, `CompactDatabase`, `Dispose`.
 
 ### Requirements
 
@@ -43,7 +44,7 @@
 ### Quick start
 
 ```powershell
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+. $PSScriptRoot/HashTableDB1/HashtableDB1-Class.ps1   # dot-source: [HashTableDB1] + JSON converter
 
 # Create (or open) a database
 $db = [HashTableDB1]::new()
@@ -94,9 +95,29 @@ $db.Dispose()
 | `SaveToDiskAsync()` | Asynchronous save via background runspace. |
 | `LoadFromDisk()` | Synchronous load with legacy-XML fallback and recovery from `.tmp` / `.old`. |
 | `LoadFromDiskAsync()` | Asynchronous load; class rehydration happens on the main thread. |
+| `UpsertNestedHashTableKey($Key, $SubKey, $Value)` | Atomic (CAS-retried) upsert of a secondary key inside a hashtable record. |
+| `RemoveNestedHashTableKey($Key, $SubKey)` | Removes a secondary key; removes the record when it becomes empty. |
+| `SaveTransactionLogAsync()` | Writes unsaved operation deltas to `TxLog/*.txlog` in the background. |
+| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForPendingTransactionLogOperations()` | Block until the corresponding async operation completes. |
 | `CreateEmptyDB()` | Clears all in-memory state. |
 | `EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite)` | Creates the DB folder and applies ACL for the given SID. |
 | `Dispose()` | Waits for all async work, unregisters events, disposes pools. |
+
+### Configuration properties
+
+| Property | Default | Description |
+| --- | --- | --- |
+| `DatabaseFolderPath` | `"./"` | Storage folder (created on save). |
+| `DatabaseFileName` | `"HashTableDB"` | Base name of the three files. |
+| `StorageFormat` | `'Json'` | `'Json'` (default: fast, readable, type-fidelity markers) or `'Xml'` (CLIXML compatibility mode). |
+| `NumOfDbBackupsToKeep` | `0` | Timestamped backups kept in `OLD/` (0 = none). |
+| `DatabaseParamsHT` | `@{}` | User parameters persisted with the DB (stored inside the deletes file). |
+| `ReadOnlyMode` | `$false` | Blocks all write operations. |
+| `EnableTransactionLog` | `$false` | Enables the transaction log. |
+| `TxLogRetentionDays` | `3` | Retention window for `.txlog` files and in-memory tick state. |
+| `LockFileMaxWaitTime` | `30` | Max seconds to wait for a stuck async operation before force-kill. |
+| `ErrorLevel` / `ErrorText` | `0` / `$null` | Result of the last operation: `0` = success, string code = error. |
+| `MainFileLoadedDT` / `UpdatesFileLoadedDT` / `RemovedFileLoadedDT` | - | Per-file load/save timestamps; drive incremental loads (unchanged files are skipped). |
 
 ### Type fidelity
 
@@ -105,6 +126,20 @@ Values are stored with a type tag, so these round-trip exactly:
 `[int]`, `[long]`, `[double]`, `[decimal]`, `[bool]`, `[string]`, `[datetime]`, `[guid]`, `[array]`, `[hashtable]` (nested).
 
 PowerShell classes (user-defined, non-`System.*` / non-`Microsoft.*` namespaces) are serialized with a `~C` marker and rehydrated by `HashtableDB1Class_RestoreClassesScriptBlock` on load. Complex `System.*` types fall back to minified CLIXML.
+
+JSON markers used by the converter:
+
+| Marker | Restored as |
+| --- | --- |
+| `{"~": true, ...}` | `PSCustomObject` |
+| `{"~i": true, "123": ...}` | hashtable with Int32 keys |
+| `{"~D": "2024-06-15T14:30:45.1230000Z"}` | `DateTime` with exact value and `Kind` |
+| `{"~m": "999999999999999.99"}` | `decimal` with exact scale |
+| `{"~S": "2024-06-15T..."}` | date-shaped string (never auto-converted to `DateTime`) |
+| `{"~C": "MyClass", ...}` | instance of your PowerShell class |
+| `{"__CLIXML__": "<Objs..."}` | complex .NET types via CLIXML |
+
+In `Xml` (CLIXML) mode these tags do not exist: primitives, `DateTime`, arrays and hashtables round-trip via native `PSSerializer` semantics, while PowerShell classes come back as `Deserialized.*` property bags (accepted compatibility trade-off).
 
 ### Architecture
 
@@ -131,13 +166,34 @@ PowerShell classes (user-defined, non-`System.*` / non-`Microsoft.*` namespaces)
        *_deletes.json           *_deletes.json
 ```
 
+## Performance
+
+Measured by the bundled suite (`code_testing/Test-Hashtable-DB1.ps1`) in fresh processes,
+PowerShell 7, desktop hardware, records ≈ 1 KB:
+
+| Operation | Volume | Json (default) | Xml (compatibility mode) |
+| --- | --- | --- | --- |
+| `Add` | 120 000 records | ≈ 3.2-3.7 s | format-independent* |
+| `Get` | 50 000 lookups | ≈ 0.43 s | format-independent* |
+| Random `Get` | 10 000 of 100 000 | ≈ 0.10 s | format-independent* |
+| `SaveToDisk` | 120 000 records (~120 MB Json) | ≈ 0.21 s (~570 000 rec/s) | ≈ 2.4 s (~11× slower) |
+| `LoadFromDisk` | 120 000 records | ≈ 0.79 s (~152 000 rec/s) | ≈ 2.4 s (~3× slower) |
+| `SaveToDiskAsync` ×2 | 120 000 records | ≈ 0.29 s | ≈ 2.4 s |
+| Peak transient memory on `SaveToDisk` | 120 000 records | ≈ +80 MB | ≈ +0.9 GB |
+| `CompactDatabase` | 100 000-record base | ≈ 0.1 ms (reference swap) | same |
+
+\* In-memory operations do not depend on the storage format. However, a large Xml save leaves
+Large Object Heap residue (the whole CLIXML document is built as a single in-memory string),
+which can slow down subsequent in-memory work until the heap is trimmed - prefer `Json`
+unless legacy consumers require CLIXML.
+
 ---
 
 ## Asynchronous operations
 
 HashTableDB1 ships **three independent async subsystems**, each backed by its own
 persistent `RunspacePool(1,1)` and a `Register-ObjectEvent`-driven completion handler.
-The caller thread **never blocks** on disk I/O — GUI scripts stay responsive while
+The caller thread **never blocks** on disk I/O - GUI scripts stay responsive while
 multi-hundred-MB databases are being flushed or loaded.
 
 | Subsystem | Entry point | Completion wait | Backing field |
@@ -149,13 +205,13 @@ multi-hundred-MB databases are being flushed or loaded.
 ### Typical async workflow
 
 ```powershell
-# 1. Start a background load — returns immediately
+# 1. Start a background load - returns immediately
 $db = [HashTableDB1]::new()
 $db.DatabaseFolderPath = "$PWD"
 $db.DatabaseFileName   = "MyDB"
 $db.LoadFromDiskAsync()
 
-# 2. Do something else on the main thread (render UI, parse args, …)
+# 2. Do something else on the main thread (render UI, parse args, ...)
 Show-SplashScreen
 
 # 3. Block only when the data is actually needed
@@ -169,22 +225,22 @@ $db.SaveToDiskAsync()
 
 ### Why async matters
 
-- **No GUI freeze** — the `InvocationStateChanged` event action is deliberately lightweight;
+- **No GUI freeze** - the `InvocationStateChanged` event action is deliberately lightweight;
   heavy work (deserialization, `ConcurrentDictionary` build, TxLog rebuild) happens *inside*
   the background runspace.
-- **Atomic state swap** — `MergedHT` is replaced **last**, so concurrent readers keep serving
+- **Atomic state swap** - `MergedHT` is replaced **last**, so concurrent readers keep serving
   the old consistent view until the very end of the swap. Assignment order:
   `MainHT` → `UpdatesHT` → `RemovedHT` → `MergedHT`.
-- **Lightweight rehydration on the main thread** — `LoadFromDiskAsync` collects
+- **Lightweight rehydration on the main thread** - `LoadFromDiskAsync` collects
   `~C` marker nodes in the background (Phase 3), then the event action rehydrates them
   in reverse DFS order so nested instances exist before their containers copy them out
   of raw hashtables. If no `~C` markers were seen, the traversal is skipped entirely.
-- **Bounded waits** — every `WaitFor*` uses `LockFileMaxWaitTime` (default **30 s**);
+- **Bounded waits** - every `WaitFor*` uses `LockFileMaxWaitTime` (default **30 s**);
   on timeout the runspace is force-killed and the pool re-created on next use.
-- **Self-healing** — bad `PSEventJob` states (`Failed`, `Blocked`) are detected and cleaned
+- **Self-healing** - bad `PSEventJob` states (`Failed`, `Blocked`) are detected and cleaned
   up automatically via `CleanupAsync`. `HadErrors` streams are surfaced via
   `writeAsyncInstanceErrors` with category, ID and script stack trace.
-- **Persistent pools** — `RunspacePool` instances are created once and reused across
+- **Persistent pools** - `RunspacePool` instances are created once and reused across
   every call, avoiding cold-start cost on each save / load / TxLog flush.
 
 ### Async error handling
@@ -234,9 +290,9 @@ Content is a compact JSON array of `[op, key, value, tick]` tuples:
 ]
 ```
 
-- `op` — `"A"` (add/update) or `"R"` (remove)
-- `value` — actual value for `"A"`, `null` for `"R"`
-- `tick` — `DateTime.UtcNow.ToFileTimeUtc()`
+- `op` - `"A"` (add/update) or `"R"` (remove)
+- `value` - actual value for `"A"`, `null` for `"R"`
+- `tick` - `DateTime.UtcNow.ToFileTimeUtc()`
 
 The writer also maintains two in-memory indexes:
 
@@ -253,9 +309,9 @@ needs no external lock.
 
 `SaveTxLogScriptBlock` performs **three cleanup passes** on every flush:
 
-1. `KeyToTick` — drop keys whose last tick is older than the retention window.
-2. `TickToKeys` — drop tick buckets older than the window (under `TickToKeysLock`).
-3. On-disk `.txlog` files — regex-matched by name and deleted if
+1. `KeyToTick` - drop keys whose last tick is older than the retention window.
+2. `TickToKeys` - drop tick buckets older than the window (under `TickToKeysLock`).
+3. On-disk `.txlog` files - regex-matched by name and deleted if
    `GetLastWriteTime < cutoff` (3 retry attempts on `IOException`).
 
 `LastTransactionLogSavedTimestamp` tracks the high-water mark so only **new** deltas
@@ -277,10 +333,10 @@ policy keeps disk usage bounded without operator intervention.
 
 ### TxLog performance notes
 
-- Entries are stored as `[System.Tuple]::Create($key, $op)` — direct .NET allocation
+- Entries are stored as `[System.Tuple]::Create($key, $op)` - direct .NET allocation
   without `PSObject` wrapping, significantly faster than hashtable literals on bulk deltas.
 - `KeyToTick` is a `ConcurrentDictionary`; `TickToKeys` is a `SortedDictionary`
-  guarded by a single `Monitor` lock — one lock acquisition per batch, not per key.
+  guarded by a single `Monitor` lock - one lock acquisition per batch, not per key.
 - The TxLog writer runs in its own `RunspacePool(1,1)`; a save of the main DB and a
   TxLog flush can run **concurrently**.
 
@@ -302,7 +358,7 @@ OLD/MyDB_deletes.20260115-134501
 
 Retention is enforced by `_MoveOld`, which sorts backups lexicographically
 (timestamp order) and deletes the oldest overflow. All file operations use
-`_RetryFileOp` — 5 attempts with 100 ms backoff on `IOException` /
+`_RetryFileOp` - 5 attempts with 100 ms backoff on `IOException` /
 `UnauthorizedAccessException` (AV scanners, search indexers, etc.).
 
 ### Automatic recovery
@@ -318,18 +374,23 @@ a good `.old`:
 *_deletes.json →  *_deletes.json.tmp →  *_deletes.json.old
 ```
 
-Legacy `.xml` files from earlier versions are transparently handled:
+Legacy `.xml` files from earlier versions are transparently handled, and the
+`StorageFormat` property controls which format is written:
 
-- If `<file>_main.json` does not exist but `<file>_main.xml` does, the XML is loaded
-  via `PSSerializer.Deserialize`.
-- After the first successful JSON save, legacy `.xml` files are archived to `OLD/`
-  (when backups are enabled) or deleted, so they are never re-loaded.
+- Files are picked up JSON-first: if `<file>_main.json` does not exist but
+  `<file>_main.xml` does, the XML is loaded via `PSSerializer.Deserialize`.
+- Cross-format migration is automatic in both directions: after loading files whose
+  format differs from `StorageFormat`, the database is resaved in the configured format
+  and the old-format files are archived to `OLD/` (when backups are enabled) or deleted -
+  the folder always holds exactly one format.
+- `StorageFormat = 'Xml'` (CLIXML compatibility mode) keeps writing classic
+  `PSSerializer` XML for legacy consumers that cannot read JSON.
 
 ### Error codes
 
 | Code | Meaning |
 | --- | --- |
-| `LFX1` | Main database file does not exist (first run — treated as normal). |
+| `LFX1` | Main database file does not exist (first run - treated as normal). |
 | `LFX2` | Main database corrupted and no valid fallback found. |
 | `LFX4` | Updates database corrupted and no valid fallback found. |
 | `LFX6` | Deletes database corrupted and no valid fallback found. |
@@ -346,14 +407,17 @@ Legacy `.xml` files from earlier versions are transparently handled:
 ### Testing
 
 ```powershell
-Invoke-Pester ./tests
+# The suite is a plain script (not Pester) - run it in a fresh process
+pwsh -NoProfile -File ./code_testing/Test-Hashtable-DB1.ps1
 ```
 
-Expected: **14 / 14 passed**.
+The `$StorageFormatToTest` variable at the top of the script selects the storage format for
+save/load tests (`'json'` or `'xml'`). Expected: **14 / 14 passed** in Json mode; in Xml mode
+Test 14 (JSON type-fidelity markers) is skipped by design.
 
 ### License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
 
 ---
 
@@ -362,8 +426,8 @@ MIT — see [LICENSE](LICENSE).
 
 ### Обзор
 
-**HashTableDB1** — лёгкое, не имеющее зависимостей, персистентное хранилище
-«ключ–значение», написанное на чистом PowerShell 7+. Данные сохраняются в JSON-файл,
+**HashTableDB1** - лёгкое, не имеющее зависимостей, персистентное хранилище
+«ключ-значение», написанное на чистом PowerShell 7+. Данные сохраняются в JSON-файлы (или классический CLIXML XML в режиме совместимости),
 поддерживается асинхронная запись и загрузка, а также точное сохранение .NET-типов
 через внутреннюю систему тегов. Дополнительно реализован опциональный
 append-only **транзакционный лог (TxLog)** для синхронизации реплик и
@@ -371,14 +435,15 @@ append-only **транзакционный лог (TxLog)** для синхро�
 
 ### Возможности
 
-- **Персистентность** — данные переживают перезапуск процесса (JSON на диске).
-- **Потокобезопасность** — синхронизация через `[System.Threading.Monitor]` и `ReaderWriterLockSlim`.
-- **Асинхронный ввод-вывод** — три независимые фоновые подсистемы (save, load, TxLog) работают в постоянных `RunspacePool(1,1)` и не блокируют вызывающий поток.
-- **Точность типов** — целые, длинные, дробные, логические, даты, GUID, массивы и вложенные хеш-таблицы восстанавливаются без потерь.
-- **Транзакционный лог** — опциональный append-only журнал всех `Add` / `Remove` с тиками `FileTimeUtc`.
-- **Ротация бэкапов** — временные метки `.old` с настраиваемым хранением.
-- **Ноль зависимостей** — только PowerShell 7+.
-- **Простой API** — `Add`, `Remove`, `Get`, `ContainsKey`, `GetAllKeys`, `GetAllValues`, `SaveToDisk`, `SaveToDiskAsync`, `LoadFromDisk`, `LoadFromDiskAsync`, `CompactDatabase`, `Dispose`.
+- **Персистентность** - данные переживают перезапуск процесса (JSON на диске).
+- **Потокобезопасность** - чтение без блокировок поверх `ConcurrentDictionary`; записи через CAS-повторы, состояние TxLog защищено `[System.Threading.Monitor]`.
+- **Асинхронный ввод-вывод** - три независимые фоновые подсистемы (save, load, TxLog) работают в постоянных `RunspacePool(1,1)` и не блокируют вызывающий поток.
+- **Точность типов** - целые, длинные, дробные, логические, даты, GUID, массивы и вложенные хеш-таблицы восстанавливаются без потерь.
+- **Транзакционный лог** - опциональный append-only журнал всех `Add` / `Remove` с тиками `FileTimeUtc`.
+- **Ротация бэкапов** - временные метки `.old` с настраиваемым хранением.
+- **Режим совместимости CLIXML** - `StorageFormat = 'Xml'` пишет классический XML `PSSerializer` для легаси-потребителей; файлы другого формата мигрируют автоматически (уходят в `OLD/`), поэтому в папке всегда ровно один формат.
+- **Ноль зависимостей** - только PowerShell 7+.
+- **Простой API** - `Add`, `Remove`, `Get`, `ContainsKey`, `GetAllKeys`, `GetAllValues`, `SaveToDisk`, `SaveToDiskAsync`, `LoadFromDisk`, `LoadFromDiskAsync`, `CompactDatabase`, `Dispose`.
 
 ### Требования
 
@@ -388,7 +453,7 @@ append-only **транзакционный лог (TxLog)** для синхро�
 ### Быстрый старт
 
 ```powershell
-Import-Module ./HashTableDB1/HashTableDB1.psm1
+. $PSScriptRoot/HashTableDB1/HashtableDB1-Class.ps1   # dot-sourcing: [HashTableDB1] и конвертер загружены
 
 # Создать (или открыть) базу
 $db = [HashTableDB1]::new()
@@ -410,7 +475,7 @@ if ($db.ContainsKey('counter')) { $db.Get('counter') }
 # Удаление
 $db.Remove('counter')
 
-# Синхронное сохранение (или SaveToDiskAsync — не блокирует)
+# Синхронное сохранение (или SaveToDiskAsync - не блокирует)
 $db.SaveToDisk()
 
 # Загрузка обратно
@@ -433,15 +498,35 @@ $db.Dispose()
 | `GetAllKeys()` | Все ключи merged-представления. |
 | `GetAllValues()` | Все значения merged-представления. |
 | `GetPendingChangesCount()` | Число записей в `UpdatesHT` + `RemovedHT`. |
-| `Clone()` | Возвращает `Hashtable` без учёта регистра — снимок merged. |
+| `Clone()` | Возвращает `Hashtable` без учёта регистра - снимок merged. |
 | `CompactDatabase()` | Атомарно переносит `MergedHT` в `MainHT` и сбрасывает дельты. |
 | `SaveToDisk()` | Синхронное сохранение (авто-компакт при дельтах > 30 % от main). |
 | `SaveToDiskAsync()` | Асинхронное сохранение через фоновый runspace. |
 | `LoadFromDisk()` | Синхронная загрузка с fallback на legacy-XML и восстановлением из `.tmp` / `.old`. |
-| `LoadFromDiskAsync()` | Асинхронная загрузка; рехидратация классов — в основном потоке. |
+| `LoadFromDiskAsync()` | Асинхронная загрузка; рехидратация классов - в основном потоке. |
+| `UpsertNestedHashTableKey($Key, $SubKey, $Value)` | Атомарный (CAS-повторы) upsert вторичного ключа внутри записи-хеш-таблицы. |
+| `RemoveNestedHashTableKey($Key, $SubKey)` | Удаляет вторичный ключ; удаляет запись, когда она опустела. |
+| `SaveTransactionLogAsync()` | Фоновая запись несохранённых дельт операций в `TxLog/*.txlog`. |
+| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForPendingTransactionLogOperations()` | Блокируются до завершения соответствующей async-операции. |
 | `CreateEmptyDB()` | Очищает всё in-memory состояние. |
 | `EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite)` | Создаёт папку БД и назначает ACL для указанного SID. |
 | `Dispose()` | Ждёт все async-операции, снимает события, dispose пулов. |
+
+### Свойства конфигурации
+
+| Свойство | По умолчанию | Описание |
+| --- | --- | --- |
+| `DatabaseFolderPath` | `"./"` | Папка хранения (создаётся при сохранении). |
+| `DatabaseFileName` | `"HashTableDB"` | Базовое имя трёх файлов. |
+| `StorageFormat` | `'Json'` | `'Json'` (по умолчанию: быстро, читаемо, маркеры точности типов) или `'Xml'` (режим совместимости CLIXML). |
+| `NumOfDbBackupsToKeep` | `0` | Датированных бэкапов в `OLD/` (0 = не хранить). |
+| `DatabaseParamsHT` | `@{}` | Пользовательские параметры, хранимые вместе с БД (внутри deletes-файла). |
+| `ReadOnlyMode` | `$false` | Блокирует все операции записи. |
+| `EnableTransactionLog` | `$false` | Включает транзакционный лог. |
+| `TxLogRetentionDays` | `3` | Окно хранения `.txlog`-файлов и тиков в памяти. |
+| `LockFileMaxWaitTime` | `30` | Максимум секунд ожидания зависшей async-операции до принудительного завершения. |
+| `ErrorLevel` / `ErrorText` | `0` / `$null` | Результат последней операции: `0` = успех, строковый код = ошибка. |
+| `MainFileLoadedDT` / `UpdatesFileLoadedDT` / `RemovedFileLoadedDT` | - | Таймстампы загрузки/сохранения по файлам; движок инкрементальных загрузок. |
 
 ### Точность типов
 
@@ -452,6 +537,22 @@ $db.Dispose()
 Пользовательские классы PowerShell (не из `System.*` / `Microsoft.*`) сериализуются
 с маркером `~C` и восстанавливаются через `HashtableDB1Class_RestoreClassesScriptBlock`.
 Сложные `System.*`-типы падают в minified CLIXML.
+
+Маркеры JSON, используемые конвертером:
+
+| Маркер | Восстанавливается как |
+| --- | --- |
+| `{"~": true, ...}` | `PSCustomObject` |
+| `{"~i": true, "123": ...}` | хеш-таблица с ключами Int32 |
+| `{"~D": "2024-06-15T14:30:45.1230000Z"}` | `DateTime` с точным значением и `Kind` |
+| `{"~m": "999999999999999.99"}` | `decimal` с точным масштабом |
+| `{"~S": "2024-06-15T..."}` | строка вида даты (никогда не превращается в `DateTime`) |
+| `{"~C": "MyClass", ...}` | экземпляр вашего класса PowerShell |
+| `{"__CLIXML__": "<Objs..."}` | сложные типы .NET через CLIXML |
+
+В режиме `Xml` (CLIXML) этих маркеров нет: примитивы, `DateTime`, массивы и хеш-таблицы
+проходят круг через нативную семантику `PSSerializer`, а классы PowerShell возвращаются
+как `Deserialized.*`-обёртки (принятая плата совместимости).
 
 ### Архитектура
 
@@ -478,13 +579,34 @@ $db.Dispose()
        *_deletes.json           *_deletes.json
 ```
 
+## Производительность
+
+Замерено комплектом тестов (`code_testing/Test-Hashtable-DB1.ps1`) в свежих процессах,
+PowerShell 7, настольное железо, записи ≈ 1 КБ:
+
+| Операция | Объём | Json (по умолчанию) | Xml (режим совместимости) |
+| --- | --- | --- | --- |
+| `Add` | 120 000 записей | ≈ 3.2-3.7 с | не зависит от формата* |
+| `Get` | 50 000 чтений | ≈ 0.43 с | не зависит от формата* |
+| Случайный `Get` | 10 000 из 100 000 | ≈ 0.10 с | не зависит от формата* |
+| `SaveToDisk` | 120 000 записей (~120 МБ Json) | ≈ 0.21 с (~570 000 зап/с) | ≈ 2.4 с (≈ в 11 раз медленнее) |
+| `LoadFromDisk` | 120 000 записей | ≈ 0.79 с (~152 000 зап/с) | ≈ 2.4 с (≈ в 3 раза медленнее) |
+| `SaveToDiskAsync` ×2 | 120 000 записей | ≈ 0.29 с | ≈ 2.4 с |
+| Пиковая транзиентная память при `SaveToDisk` | 120 000 записей | ≈ +80 МБ | ≈ +0.9 ГБ |
+| `CompactDatabase` | база 100 000 записей | ≈ 0.1 мс (обмен ссылок) | так же |
+
+\* Операции в памяти не зависят от формата хранения. Однако крупное сохранение в Xml оставляет
+«осадок» в Large Object Heap (весь CLIXML-документ строится одной строкой в памяти), что может
+замедлять последующие операции в памяти до усадки кучи - используйте `Json`, если CLIXML
+не требуется легаси-потребителям.
+
 ---
 
 ## Асинхронные операции
 
 HashTableDB1 содержит **три независимые асинхронные подсистемы**, каждая со своим
 постоянным `RunspacePool(1,1)` и обработчиком завершения через `Register-ObjectEvent`.
-Вызывающий поток **никогда не блокируется** на дисковом вводе-выводе — GUI-скрипт
+Вызывающий поток **никогда не блокируется** на дисковом вводе-выводе - GUI-скрипт
 остаётся отзывчивым, пока многогигабайтная база сбрасывается на диск или загружается.
 
 | Подсистема | Точка входа | Ожидание завершения | Поле состояния |
@@ -496,7 +618,7 @@ HashTableDB1 содержит **три независимые асинхронн
 ### Типичный асинхронный сценарий
 
 ```powershell
-# 1. Запускаем фоновую загрузку — управление возвращается сразу
+# 1. Запускаем фоновую загрузку - управление возвращается сразу
 $db = [HashTableDB1]::new()
 $db.DatabaseFolderPath = "$PWD"
 $db.DatabaseFileName   = "MyDB"
@@ -516,25 +638,25 @@ $db.SaveToDiskAsync()
 
 ### Почему это важно
 
-- **GUI не замерзает** — обработчик `InvocationStateChanged` намеренно лёгкий;
+- **GUI не замерзает** - обработчик `InvocationStateChanged` намеренно лёгкий;
   тяжёлая работа (десериализация, сборка `ConcurrentDictionary`, перестройка TxLog)
   выполняется *внутри* фонового runspace.
-- **Атомарная подмена состояния** — `MergedHT` заменяется **последним**, поэтому
+- **Атомарная подмена состояния** - `MergedHT` заменяется **последним**, поэтому
   конкурентные читатели видят старый консистентный снимок до самого конца подмены.
   Порядок присваивания: `MainHT` → `UpdatesHT` → `RemovedHT` → `MergedHT`.
-- **Лёгкая рехидратация в основном потоке** — `LoadFromDiskAsync` собирает узлы
+- **Лёгкая рехидратация в основном потоке** - `LoadFromDiskAsync` собирает узлы
   с маркером `~C` в фоне (фаза 3), а затем обработчик события восстанавливает их
   в обратном DFS-порядке, чтобы вложенные экземпляры существовали раньше, чем их
   контейнеры скопируют их из сырых хеш-таблиц. Если маркеров `~C` не было,
   обход полностью пропускается.
-- **Ограниченные ожидания** — каждый `WaitFor*` использует `LockFileMaxWaitTime`
+- **Ограниченные ожидания** - каждый `WaitFor*` использует `LockFileMaxWaitTime`
   (по умолчанию **30 с**); по таймауту runspace принудительно убивается, а пул
   пересоздаётся при следующем вызове.
-- **Самовосстановление** — «плохие» состояния `PSEventJob` (`Failed`, `Blocked`)
+- **Самовосстановление** - «плохие» состояния `PSEventJob` (`Failed`, `Blocked`)
   обнаруживаются и чистятся автоматически через `CleanupAsync`. Ошибки из
   `HadErrors` выводятся через `writeAsyncInstanceErrors` с категорией, ID и
   стеком вызовов.
-- **Постоянные пулы** — `RunspacePool` создаётся один раз и переиспользуется
+- **Постоянные пулы** - `RunspacePool` создаётся один раз и переиспользуется
   во всех вызовах, что избавляет от холодного старта на каждом save / load / TxLog.
 
 ### Обработка ошибок в async
@@ -555,7 +677,7 @@ finally { [HashTableDB1]::CleanupAsync([ref]$thisObj.AsynchronousSaveOperationSt
 
 ## Транзакционный лог (TxLog)
 
-TxLog — это **опциональный append-only журнал**, фиксирующий каждую операцию
+TxLog - это **опциональный append-only журнал**, фиксирующий каждую операцию
 `Add` / `Remove` с монотонно возрастающим тиком `FileTimeUtc`. Предназначен для
 **синхронизации реплик** и **восстановления на момент времени**.
 
@@ -575,7 +697,7 @@ $db.DatabaseFolderPath     = "$PWD"
 <DatabaseFileName>_<firstTick>_<lastTick>.txlog
 ```
 
-Содержимое — компактный JSON-массив кортежей `[op, key, value, tick]`:
+Содержимое - компактный JSON-массив кортежей `[op, key, value, tick]`:
 
 ```json
 [
@@ -584,28 +706,28 @@ $db.DatabaseFolderPath     = "$PWD"
 ]
 ```
 
-- `op` — `"A"` (add/update) или `"R"` (remove)
-- `value` — фактическое значение для `"A"`, `null` для `"R"`
-- `tick` — `DateTime.UtcNow.ToFileTimeUtc()`
+- `op` - `"A"` (add/update) или `"R"` (remove)
+- `value` - фактическое значение для `"A"`, `null` для `"R"`
+- `tick` - `DateTime.UtcNow.ToFileTimeUtc()`
 
 Писатель также поддерживает два in-memory индекса:
 
 | Поле | Тип | Назначение |
 | --- | --- | --- |
-| `KeyToTick` | `ConcurrentDictionary[string, long]` | Последний тик по ключу — для обрезки по retention. |
+| `KeyToTick` | `ConcurrentDictionary[string, long]` | Последний тик по ключу - для обрезки по retention. |
 | `TickToKeys` | `SortedDictionary[long, List<Tuple<string,string>>]` | Хронологический порядок записей `(key, op)`. |
 
 `TickToKeys` защищён `TickToKeysLock` (`[System.Threading.Monitor]`), потому что
-`SortedDictionary` не потокобезопасен. `KeyToTick` — `ConcurrentDictionary`,
+`SortedDictionary` не потокобезопасен. `KeyToTick` - `ConcurrentDictionary`,
 внешняя блокировка не нужна.
 
 ### Хранение и очистка
 
 `SaveTxLogScriptBlock` выполняет **три прохода очистки** при каждом сбросе:
 
-1. `KeyToTick` — удаляются ключи, последний тик которых старше окна хранения.
-2. `TickToKeys` — удаляются бакеты тиков старше окна (под `TickToKeysLock`).
-3. Файлы `.txlog` на диске — сопоставляются регуляркой и удаляются, если
+1. `KeyToTick` - удаляются ключи, последний тик которых старше окна хранения.
+2. `TickToKeys` - удаляются бакеты тиков старше окна (под `TickToKeysLock`).
+3. Файлы `.txlog` на диске - сопоставляются регуляркой и удаляются, если
    `GetLastWriteTime < cutoff` (3 попытки при `IOException`).
 
 `LastTransactionLogSavedTimestamp` хранит high-water mark, поэтому при следующем
@@ -627,10 +749,10 @@ $db.DatabaseFolderPath     = "$PWD"
 
 ### Производительность TxLog
 
-- Записи хранятся как `[System.Tuple]::Create($key, $op)` — прямая аллокация .NET
+- Записи хранятся как `[System.Tuple]::Create($key, $op)` - прямая аллокация .NET
   без обёртки `PSObject`, что значительно быстрее хеш-табличных литералов на
   массовых дельтах.
-- `KeyToTick` — `ConcurrentDictionary`; `TickToKeys` — `SortedDictionary` под
+- `KeyToTick` - `ConcurrentDictionary`; `TickToKeys` - `SortedDictionary` под
   одним `Monitor`-локом: одно взятие блокировки на пачку, а не на ключ.
 - Писатель TxLog работает в отдельном `RunspacePool(1,1)`, поэтому сохранение
   основной БД и сброс TxLog могут идти **параллельно**.
@@ -653,7 +775,7 @@ OLD/MyDB_deletes.20260115-134501
 
 Политику хранения обеспечивает `_MoveOld`: сортирует бэкапы лексикографически
 (в порядке timestamp) и удаляет самые старые излишки. Все файловые операции
-используют `_RetryFileOp` — 5 попыток с задержкой 100 мс при `IOException` /
+используют `_RetryFileOp` - 5 попыток с задержкой 100 мс при `IOException` /
 `UnauthorizedAccessException` (антивирусы, индексаторы и т. п.).
 
 ### Автоматическое восстановление
@@ -669,18 +791,23 @@ OLD/MyDB_deletes.20260115-134501
 *_deletes.json →  *_deletes.json.tmp →  *_deletes.json.old
 ```
 
-Legacy `.xml` из старых версий обрабатываются прозрачно:
+Legacy `.xml` из старых версий обрабатываются прозрачно, а свойство `StorageFormat`
+управляет тем, какой формат записывается:
 
-- Если `<file>_main.json` нет, но `<file>_main.xml` есть — XML загружается через
-  `PSSerializer.Deserialize`.
-- После первого успешного JSON-сохранения legacy `.xml` архивируются в `OLD/`
-  (если включены бэкапы) или удаляются, чтобы больше не загружаться.
+- Файлы выбираются с приоритетом JSON: если `<file>_main.json` нет, но `<file>_main.xml`
+  есть - XML загружается через `PSSerializer.Deserialize`.
+- Миграция между форматами автоматическая в обе стороны: после загрузки файлов, формат
+  которых отличается от `StorageFormat`, база пересохраняется в настроенном формате, а
+  файлы старого формата уходят в `OLD/` (если включены бэкапы) или удаляются - в папке
+  всегда ровно один формат.
+- `StorageFormat = 'Xml'` (режим совместимости CLIXML) продолжает писать классический
+  XML `PSSerializer` для легаси-потребителей, которые не умеют читать JSON.
 
 ### Коды ошибок
 
 | Код | Значение |
 | --- | --- |
-| `LFX1` | Основной файл БД не существует (первый запуск — считается нормой). |
+| `LFX1` | Основной файл БД не существует (первый запуск - считается нормой). |
 | `LFX2` | Основная БД повреждена, валидный fallback не найден. |
 | `LFX4` | Updates-БД повреждена, валидный fallback не найден. |
 | `LFX6` | Deletes-БД повреждена, валидный fallback не найден. |
@@ -697,11 +824,14 @@ Legacy `.xml` из старых версий обрабатываются про
 ### Тестирование
 
 ```powershell
-Invoke-Pester ./tests
+# Комплект тестов - обычный скрипт (не Pester), запускать в свежем процессе
+pwsh -NoProfile -File ./code_testing/Test-Hashtable-DB1.ps1
 ```
 
-Ожидается: **14 / 14 passed**.
+Переменная `$StorageFormatToTest` в начале скрипта задаёт формат для тестов
+сохранения/загрузки (`'json'` или `'xml'`). Ожидается: **14 / 14 passed** в режиме Json;
+в режиме Xml тест 14 (маркеры точности типов JSON) пропускается по замыслу.
 
 ### Лицензия
 
-MIT — см. [LICENSE](LICENSE).
+MIT - см. [LICENSE](LICENSE).

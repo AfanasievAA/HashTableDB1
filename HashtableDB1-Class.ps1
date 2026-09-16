@@ -6,9 +6,9 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 This class is designed for high-load scenarios. It maintains three internal dictionaries: MainHT, UpdatesHT, and RemovedHT. A MergedHT provides a real-time unified view. NEVER modify the internal dictionaries directly; use the class methods. Despite method names containing "XML" (for historical compatibility), the actual persistence format is JSON.
 
 .NOTES
-  Version:        1.23
+  Version:        1.24
   Author:         Andrew Afanasiev
-  Date:           15 Sep 2026
+  Date:           16 Sep 2026
   Contacts:       AfanasievAA@yandex.ru
   !!!! NO Vibecoding here please !!!! This is heavily loaded and intense script. Any wrong "optimization" proposed by your favorite AI will probably end up in data loss! I'm not joking folks. Use your own head before committing any changes to this script.
   If you feel lucky enough to modify this, there are 3 test scripts which you can find and code_testing folder. Fire them up after your modification. Run one by one and ensure there are NO errors in any test, or else you'll end up in data loss.
@@ -160,6 +160,18 @@ public class PSObjectJsonConverter : JsonConverter<object> {
     // True if Deserialize on this thread has seen at least one '~C' marker since the last reset
     public static bool HasReadClassMarkers() { return _sawClassMarker; }
 
+    // Fast C# replacement for the slow PowerShell copy loops in Clone() and the save snapshot:
+    // builds a case-insensitive Hashtable from any IDictionary (hashtable, ConcurrentDictionary,
+    // generic Dictionary - all implement the non-generic IDictionary interface)
+    public static System.Collections.Hashtable BuildHashtable(System.Collections.IDictionary source) {
+        var ht = new System.Collections.Hashtable(System.StringComparer.OrdinalIgnoreCase);
+        if (source == null) { return ht; }
+        foreach (System.Collections.DictionaryEntry e in source) {
+            ht[e.Key] = e.Value;
+        }
+        return ht;
+    }
+
     // Fast C# replacement for slow PowerShell copy loops: builds a ConcurrentDictionary from a deserialized IDictionary
     public static System.Collections.Concurrent.ConcurrentDictionary<string, object> BuildConcurrentDictionary(System.Collections.IDictionary source, string excludeKey) {
         var cd = new System.Collections.Concurrent.ConcurrentDictionary<string, object>(System.StringComparer.OrdinalIgnoreCase);
@@ -180,18 +192,6 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         if (updatesCd != null) { foreach (var e in updatesCd) { merged[e.Key] = e.Value; } }
         if (removedCd != null) { object dummy; foreach (var e in removedCd) { merged.TryRemove(e.Key, out dummy); } }
         return merged;
-    }
-
-    // Fast C# replacement for the slow PowerShell copy loops in Clone() and the save snapshot:
-    // builds a case-insensitive Hashtable from any IDictionary (hashtable, ConcurrentDictionary,
-    // generic Dictionary - all implement the non-generic IDictionary interface)
-    public static System.Collections.Hashtable BuildHashtable(System.Collections.IDictionary source) {
-        var ht = new System.Collections.Hashtable(System.StringComparer.OrdinalIgnoreCase);
-        if (source == null) { return ht; }
-        foreach (System.Collections.DictionaryEntry e in source) {
-            ht[e.Key] = e.Value;
-        }
-        return ht;
     }
 
     // Deserializes JSON into PowerShell native types (Hashtable, ArrayList, etc.)
@@ -566,8 +566,8 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             }
             Write-Host "Created backup: $newBackupName"
         }
-        # All backup files for this backup. Match both JSON and legacy XML backups. Escape baseName to avoid regex injection.
-        $rxBak = [regex]::new('^' + [regex]::Escape($baseName) + '\.\d{8}-\d{6}(\.xml)?$')
+        # All backup files for this backup. Matches current-format backups, legacy XML backups and cross-format archived JSON backups. Escape baseName to avoid regex injection.
+        $rxBak = [regex]::new('^' + [regex]::Escape($baseName) + '\.\d{8}-\d{6}(\.(xml|json))?$')
         $backupFiles = [System.IO.Directory]::GetFiles($oldFolder, "$baseName.*") |
             ForEach-Object { [System.IO.FileInfo]::new($_) } |
             Where-Object { $rxBak.IsMatch($_.Name) }
@@ -606,45 +606,67 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
         # Disable escaping of <, > and non-ASCII to reduce JSON size
         $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+        # Storage format: 'Json' (default) or 'Xml' (CLIXML compatibility mode). All file names are
+        # parameterized by extension so the folder always holds files of a single format.
+        if ($thisObj.StorageFormat -notin @('Json','Xml')) { throw "Invalid StorageFormat '$($thisObj.StorageFormat)' - use 'Json' or 'Xml'." }
+        $ext = 'json'
+        if ($thisObj.StorageFormat -eq 'Xml') { $ext = 'xml' }
         $tmpMain = $null
         $tmpUpdates = $null
         $tmpDeletes = $null
         # New data is saved to *.tmp files. Main file saved only if modified
         if ($thisObj.IsForceSaveMain) {
-            $tmpMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.json.tmp"
-            # OPTIMIZATION: System.Text.Json streaming directly to FileStream.
-            # Stream is disposed in finally to release handle even on serialization failure.
-            # 1MB buffer: fewer, larger write syscalls on multi-hundred-MB JSON files
-            $stream = [System.IO.File]::Create($tmpMain, 1048576)
+            $tmpMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext.tmp"
+            if ($ext -eq 'xml') {
+                # CLIXML compatibility mode. Explicit depth is required: the parameterless Serialize
+                # overload silently truncates nested objects at depth 2.
+                [System.IO.File]::WriteAllText($tmpMain, [System.Management.Automation.PSSerializer]::Serialize($mainSnap, 100))
+            } else {
+                # OPTIMIZATION: System.Text.Json streaming directly to FileStream.
+                # Stream is disposed in finally to release handle even on serialization failure.
+                # 1MB buffer: fewer, larger write syscalls on multi-hundred-MB JSON files
+                $stream = [System.IO.File]::Create($tmpMain, 1048576)
+                try {
+                    [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$mainSnap, $jsonOptions)
+                } finally {
+                    $stream.Dispose()
+                }
+            }
+        }
+        $tmpUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext.tmp"
+        if ($ext -eq 'xml') {
+            # CLIXML compatibility mode (explicit depth - see the main-file block above)
+            [System.IO.File]::WriteAllText($tmpUpdates, [System.Management.Automation.PSSerializer]::Serialize($updatesSnap, 100))
+        } else {
+            $stream = [System.IO.File]::Create($tmpUpdates, 1048576)
             try {
-                [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$mainSnap, $jsonOptions)
+                [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$updatesSnap, $jsonOptions)
             } finally {
                 $stream.Dispose()
             }
-        }
-        $tmpUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.json.tmp"
-        $stream = [System.IO.File]::Create($tmpUpdates, 1048576)
-        try {
-            [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$updatesSnap, $jsonOptions)
-        } finally {
-            $stream.Dispose()
         }
         # Adding database parameters to a copy for serialization (avoid polluting live RemovedHT).
         # C# helper replaces the slow PowerShell copy loop; the type is process-wide, so it resolves
         # both on the calling thread and inside the background runspace
         $removedForSave = [PSObjectJsonConverter]::BuildHashtable($removedSnap)
+        # Database parameters travel inside the deletes snapshot (read back by the load path)
         $removedForSave["___DATABASEPARAMS___"] = $thisObj.DatabaseParamsHT
-        $tmpDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.json.tmp"
-        $stream = [System.IO.File]::Create($tmpDeletes, 1048576)
-        try {
-            [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$removedForSave, $jsonOptions)
-        } finally {
-            $stream.Dispose()
+        $tmpDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext.tmp"
+        if ($ext -eq 'xml') {
+            # CLIXML compatibility mode (explicit depth - see the main-file block above)
+            [System.IO.File]::WriteAllText($tmpDeletes, [System.Management.Automation.PSSerializer]::Serialize($removedForSave, 100))
+        } else {
+            $stream = [System.IO.File]::Create($tmpDeletes, 1048576)
+            try {
+                [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$removedForSave, $jsonOptions)
+            } finally {
+                $stream.Dispose()
+            }
         }
-        # Database files names
-        $mainJson    = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.json"
-        $updatesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.json"
-        $deletesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.json"
+        # Database files names (extension depends on StorageFormat)
+        $mainJson    = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext"
+        $updatesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext"
+        $deletesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext"
         # Renaming current files to OLD if they are present.
         if ($thisObj.IsForceSaveMain -and [System.IO.File]::Exists($mainJson)) {
             $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.old"
@@ -658,14 +680,14 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.old"
             _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($deletesJson, $dest) }
         }
-        # Renaming tmp files to JSON (actual version saved)
+        # Renaming tmp files to the final extension (actual version saved)
         if ($thisObj.IsForceSaveMain) {
-            $finalMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.json"
+            $finalMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext"
             _RetryFileOp { if ([System.IO.File]::Exists($finalMain)) { [System.IO.File]::Delete($finalMain) }; [System.IO.File]::Move($tmpMain, $finalMain) }
         }
-        $finalUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.json"
+        $finalUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext"
         _RetryFileOp { if ([System.IO.File]::Exists($finalUpdates)) { [System.IO.File]::Delete($finalUpdates) }; [System.IO.File]::Move($tmpUpdates, $finalUpdates) }
-        $finalDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.json"
+        $finalDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext"
         _RetryFileOp { if ([System.IO.File]::Exists($finalDeletes)) { [System.IO.File]::Delete($finalDeletes) }; [System.IO.File]::Move($tmpDeletes, $finalDeletes) }
         # Moving OLD files to OLD folder for backup
         $Timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -690,32 +712,36 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 }
             }
         }
-        # Legacy XML compatibility: after successful JSON commit, archive or remove old XML files to prevent them from being loaded again on the next run
-        $legacyXmlFiles = @(
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.xml",
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.xml",
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.xml"
+        # Cross-format cleanup: after a successful commit in the current format, archive or remove files of
+        # the other format so only one format is ever present in the folder (prevents stale files from being
+        # picked up by the json-first load order on the next run)
+        $otherExt = 'xml'
+        if ($ext -eq 'xml') { $otherExt = 'json' }
+        $legacyFiles = @(
+            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$otherExt",
+            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$otherExt",
+            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$otherExt"
         )
         $oldFolder = $null
-        foreach ($xmlFile in $legacyXmlFiles) {
-            if (-not [System.IO.File]::Exists($xmlFile)) { continue }
+        foreach ($legacyFile in $legacyFiles) {
+            if (-not [System.IO.File]::Exists($legacyFile)) { continue }
             if ($thisObj.NumOfDbBackupsToKeep -gt 0) {
-                # Move legacy XML files to OLD folder for backup
+                # Move files of the other format to OLD folder, keeping the original extension
                 if (-not $oldFolder) {
                     $oldFolder = Join-Path $thisObj.DatabaseFolderPath "OLD"
                     if (-not [System.IO.Directory]::Exists($oldFolder)) {
                         $null = [System.IO.Directory]::CreateDirectory($oldFolder)
                     }
                 }
-                $xmlBaseName = [System.IO.Path]::GetFileNameWithoutExtension($xmlFile)
-                $destName = "$xmlBaseName.$TimeStamp.xml"
+                $legacyBaseName = [System.IO.Path]::GetFileNameWithoutExtension($legacyFile)
+                $destName = "$legacyBaseName.$TimeStamp.$otherExt"
                 $dest = Join-Path $oldFolder $destName
-                _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($xmlFile, $dest) }
-                Write-Host "Archived legacy XML: $destName"
+                _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($legacyFile, $dest) }
+                Write-Host "Archived legacy $otherExt file: $destName"
             } else {
-                # Backup not configured - delete legacy XML files to prevent reloading
-                [System.IO.File]::Delete($xmlFile)
-                Write-Host "Removed legacy XML: $([System.IO.Path]::GetFileName($xmlFile))"
+                # Backup not configured - delete files of the other format to prevent reloading
+                [System.IO.File]::Delete($legacyFile)
+                Write-Host "Removed legacy $otherExt file: $([System.IO.Path]::GetFileName($legacyFile))"
             }
         }
         $endDateTime = [System.Datetime]::Now
@@ -788,6 +814,8 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 if ([System.IO.File]::Exists($backupFile)) {
                     try {
                         $testHT = $null
+                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
+                        $isXmlContent = $false
                         try {
                             $stream = [System.IO.File]::OpenRead($backupFile)
                             try {
@@ -798,10 +826,13 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                         } catch {
                             # Fallback to legacy XML deserialization if JSON fails
                             $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
+                            $isXmlContent = $true
                         }
                         if ($testHT -is [System.Collections.IDictionary]) {
                             Write-Warning "Main database missing. Restoring from $ext file."
-                            $destPath = "$($fullPath)_main.json"
+                            $restoreExt = 'json'
+                            if ($isXmlContent) { $restoreExt = 'xml' }
+                            $destPath = "$($fullPath)_main.$restoreExt"
                             if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
                             [System.IO.File]::Move($backupFile, $destPath)
                             $MainFile2Load = [System.IO.FileInfo]::new($destPath)
@@ -819,6 +850,8 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 if ([System.IO.File]::Exists($backupFile)) {
                     try {
                         $testHT = $null
+                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
+                        $isXmlContent = $false
                         try {
                             $stream = [System.IO.File]::OpenRead($backupFile)
                             try {
@@ -829,10 +862,13 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                         } catch {
                             # Fallback to legacy XML deserialization if JSON fails
                             $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
+                            $isXmlContent = $true
                         }
                         if ($testHT -is [System.Collections.IDictionary]) {
                             Write-Warning "Updates database missing. Restoring from $ext file."
-                            $destPath = "$($fullPath)_updates.json"
+                            $restoreExt = 'json'
+                            if ($isXmlContent) { $restoreExt = 'xml' }
+                            $destPath = "$($fullPath)_updates.$restoreExt"
                             if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
                             [System.IO.File]::Move($backupFile, $destPath)
                             $UpdatesFile2Load = [System.IO.FileInfo]::new($destPath)
@@ -850,6 +886,8 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 if ([System.IO.File]::Exists($backupFile)) {
                     try {
                         $testHT = $null
+                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
+                        $isXmlContent = $false
                         try {
                             $stream = [System.IO.File]::OpenRead($backupFile)
                             try {
@@ -860,10 +898,13 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                         } catch {
                             # Fallback to legacy XML deserialization if JSON fails
                             $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
+                            $isXmlContent = $true
                         }
                         if ($testHT -is [System.Collections.IDictionary]) {
                             Write-Warning "Deletes database missing. Restoring from $ext file."
-                            $destPath = "$($fullPath)_deletes.json"
+                            $restoreExt = 'json'
+                            if ($isXmlContent) { $restoreExt = 'xml' }
+                            $destPath = "$($fullPath)_deletes.$restoreExt"
                             if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
                             [System.IO.File]::Move($backupFile, $destPath)
                             $DeletesFile2Load = [System.IO.FileInfo]::new($destPath)
@@ -877,6 +918,11 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         }
         # End of recovery logic
 
+        # Format of the loaded main file ('Json'/'Xml'); drives cross-format migration after load
+        $mainLoadedFormat = $null
+        if ($null -ne $MainFile2Load) {
+            if ($MainFile2Load.Extension -eq '.xml') { $mainLoadedFormat = 'Xml' } else { $mainLoadedFormat = 'Json' }
+        }
         # Creating empty return result
         $resultData = @{
             Success = $false
@@ -888,6 +934,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             RemovedHT = $null
             DatabaseParamsHT = @{}
             ClassMarkersFound = $false
+            LoadedFormat = $mainLoadedFormat
             MainFileLoadedDT = $null
             UpdatesFileLoadedDT = $null
             RemovedFileLoadedDT = $null
@@ -911,8 +958,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             foreach ($tryFile in $fallbackFiles) {
                 if (-not [System.IO.File]::Exists($tryFile)) { continue }
                 try {
-                    $isJsonTry = $tryFile.EndsWith(".json")
-                    if ($isJsonTry) {
+                    if ($tryFile.EndsWith(".json")) {
                         # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
                         $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
                         try {
@@ -921,7 +967,15 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                             $stream.Dispose()
                         }
                     } else {
-                        $resultData.MainHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($tryFile))
+                        # .old files carry no format-defining extension - sniff the content instead:
+                        # CLIXML starts with '<', JSON with '{'. Without this, a JSON-filled .old would be
+                        # fed to PSSerializer and the fallback would always fail.
+                        $rawContent = [System.IO.File]::ReadAllText($tryFile)
+                        if ($rawContent.TrimStart().StartsWith('<')) {
+                            $resultData.MainHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
+                        } else {
+                            $resultData.MainHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
+                        }
                     }
                     if (-Not ($resultData.MainHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
                     $loadSuccess = $true
@@ -952,8 +1006,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             foreach ($tryFile in $fallbackFiles) {
                 if (-not [System.IO.File]::Exists($tryFile)) { continue }
                 try {
-                    $isJsonTry = $tryFile.EndsWith(".json")
-                    if ($isJsonTry) {
+                    if ($tryFile.EndsWith(".json")) {
                         # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
                         $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
                         try {
@@ -962,7 +1015,13 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                             $stream.Dispose()
                         }
                     } else {
-                        $resultData.UpdatesHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($tryFile))
+                        # .old content sniffing: CLIXML starts with '<', JSON with '{' (see the main-file block)
+                        $rawContent = [System.IO.File]::ReadAllText($tryFile)
+                        if ($rawContent.TrimStart().StartsWith('<')) {
+                            $resultData.UpdatesHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
+                        } else {
+                            $resultData.UpdatesHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
+                        }
                     }
                     if (-Not ($resultData.UpdatesHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
                     $loadSuccess = $true
@@ -993,8 +1052,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             foreach ($tryFile in $fallbackFiles) {
                 if (-not [System.IO.File]::Exists($tryFile)) { continue }
                 try {
-                    $isJsonTry = $tryFile.EndsWith(".json")
-                    if ($isJsonTry) {
+                    if ($tryFile.EndsWith(".json")) {
                         # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
                         $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
                         try {
@@ -1003,7 +1061,13 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                             $stream.Dispose()
                         }
                     } else {
-                        $resultData.RemovedHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($tryFile))
+                        # .old content sniffing: CLIXML starts with '<', JSON with '{' (see the main-file block)
+                        $rawContent = [System.IO.File]::ReadAllText($tryFile)
+                        if ($rawContent.TrimStart().StartsWith('<')) {
+                            $resultData.RemovedHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
+                        } else {
+                            $resultData.RemovedHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
+                        }
                     }
                     if (-Not ($resultData.RemovedHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
                     $loadSuccess = $true
@@ -1049,7 +1113,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
 } # End of main load scriptblock
 
 # Save transaction Log scriptblock
-$Script:HashtableDB1Class_SaveTxLogScriptBlock = {
+ $Script:HashtableDB1Class_SaveTxLogScriptBlock = {
     param(
         [object] $thisObj,
         [object] $keyToTick,
@@ -1418,6 +1482,10 @@ Class HashTableDB1 {
     $DatabaseParamsHT = @{}
     # Name of files database
     $DatabaseFileName = "HashTableDB"
+    # Storage format: 'Json' (default - fast, readable, type-fidelity markers) or 'Xml' (CLIXML compatibility
+    # mode). After loading files of the other format the database is automatically resaved in the configured
+    # format and the old-format files are archived to OLD\, so the folder always holds a single format.
+    [string] $StorageFormat = 'Json'
     $DatabaseFolderPath = ".\"
     $ErrorLevel = $null
     $ErrorText = $null
@@ -1695,7 +1763,10 @@ Class HashTableDB1 {
         if ($this.ReadOnlyMode) { return }
         $this.ErrorLevel = $null
         $this.ErrorText  = $null
-        $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.json"
+        # Storage format extension for the main-file existence check
+        $mainExt = 'json'
+        if ($this.StorageFormat -eq 'Xml') { $mainExt = 'xml' }
+        $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.$mainExt"
         # Wait for previous async save BEFORE Consolidate to prevent its finally-block from resetting IsForceSaveMain that Consolidate sets
         $this.WaitForAsyncSaveToDisk()
         # If updates database is bigger than 30% of main database
@@ -1805,7 +1876,10 @@ Class HashTableDB1 {
         if ($this.ReadOnlyMode) { return }
         $this.ErrorLevel = $null
         $this.ErrorText  = $null
-        $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.json"
+        # Storage format extension for the main-file existence check
+        $mainExt = 'json'
+        if ($this.StorageFormat -eq 'Xml') { $mainExt = 'xml' }
+        $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.$mainExt"
         # Wait for previous async save BEFORE Consolidate to prevent its finally-block from resetting IsForceSaveMain that Consolidate sets
         $this.WaitForAsyncSaveToDisk()
         # If updates database is bigger than 30% of main
@@ -2012,7 +2086,7 @@ Class HashTableDB1 {
             $this.AsynchronousTransactionLogSaveState.BeginInvokeResult = $asyncResult
         } catch {
             $this.ErrorLevel = "TXLOG3"
-            $this.ErrorText  = "Failed to start async TxLog save: $($_.Exception.Message)"
+            $this.ErrorText = "Failed to start async TxLog save: $($_.Exception.Message)"
         }
     }
     # Load database from 3 XML files to class memory
@@ -2084,6 +2158,11 @@ Class HashTableDB1 {
                     [System.Threading.Monitor]::Exit($this.TickToKeysLock)
                 }
                 $this.LastTransactionLogSavedTimestamp = 0
+            }
+            # Cross-format migration: loaded files differ from the class StorageFormat - resave in the
+            # current format; the save path archives the old-format files so the folder always holds one format
+            if ($loadResult.LoadedFormat -and ($loadResult.LoadedFormat -ne $this.StorageFormat)) {
+                $this.SaveToDisk()
             }
             return $true
         } catch {
@@ -2217,8 +2296,6 @@ Class HashTableDB1 {
                     }
                     $loadResult = $loadResultArray[0]
                     if ($loadResult.Success -and $loadResult.DataIsLoaded) {
-                        # Restore PS class instances ('~C' markers) in the loaded data before building ConcurrentDictionaries.
-                        # Event action runs in the main session where user classes are defined, so rehydration is possible here.
                         # Process '~C' nodes collected by the background runspace (Phase 3) in reverse order
                         # (children before parents) so nested instances are rehydrated before their containers
                         # copy them out of raw hashtables. Covers MainHT, UpdatesHT and DatabaseParamsHT.
@@ -2262,6 +2339,13 @@ Class HashTableDB1 {
                         $thisObj.AsyncResults['Success'] = $true
                         $thisObj.AsyncResults['Message'] = "Database $($thisObj.DatabaseFileName) loaded Asynchronously in $( [math]::Round($loadResult.LoadTime,3)) sec."
                         $thisObj.ErrorLevel = 0
+                        # Cross-format migration: loaded files differ from StorageFormat - start an async
+                        # resave; the save path archives the old-format files so the folder holds one format.
+                        # SaveToDiskAsync clears AsyncResults and repopulates them on completion, so a waiter
+                        # blocks until the migration save has finished.
+                        if ($loadResult.LoadedFormat -and ($loadResult.LoadedFormat -ne $thisObj.StorageFormat)) {
+                            $thisObj.SaveToDiskAsync()
+                        }
                     } elseif ($loadResult.Success) {
                         # Success but no new data to load (files not newer)
                         $thisObj.AsyncResults['Success'] = $true
