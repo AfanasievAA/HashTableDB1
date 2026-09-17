@@ -6,9 +6,9 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 This class is designed for high-load scenarios. It maintains three internal dictionaries: MainHT, UpdatesHT, and RemovedHT. A MergedHT provides a real-time unified view. NEVER modify the internal dictionaries directly; use the class methods. Despite method names containing "XML" (for historical compatibility), the actual persistence format is JSON.
 
 .NOTES
-  Version:        1.24
+  Version:        1.25
   Author:         Andrew Afanasiev
-  Date:           16 Sep 2026
+  Date:           17 Sep 2026
   Contacts:       AfanasievAA@yandex.ru
   !!!! NO Vibecoding here please !!!! This is heavily loaded and intense script. Any wrong "optimization" proposed by your favorite AI will probably end up in data loss! I'm not joking folks. Use your own head before committing any changes to this script.
   If you feel lucky enough to modify this, there are 3 test scripts which you can find and code_testing folder. Fire them up after your modification. Run one by one and ensure there are NO errors in any test, or else you'll end up in data loss.
@@ -159,6 +159,111 @@ public class PSObjectJsonConverter : JsonConverter<object> {
 
     // True if Deserialize on this thread has seen at least one '~C' marker since the last reset
     public static bool HasReadClassMarkers() { return _sawClassMarker; }
+
+    // Class-name resolution is passed from PowerShell as System.Func<string, System.Type> (a BCL type,
+    // always resolvable at PowerShell class compile time) because user class types live in the session
+    // state, invisible to this assembly.
+
+    // Fast C# replacement for the slow PowerShell traversal in RestoreClassesScriptBlock/Phase 3:
+    // walks all container roots (IDictionary / Array / PSObject) iteratively with a stack and a
+    // reference-identity visited set, and collects '~C' hashtable nodes together with their exact
+    // parent container and slot (dictionary key / array index / property name). Nodes are appended
+    // in DFS order (containers before children); process the list in reverse to rehydrate children
+    // before their parents copy them out of raw hashtables.
+    public static List<object[]> CollectClassNodes(object[] roots) {
+        var pending = new List<object[]>();
+        if (roots == null) { return pending; }
+        var visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var stack = new Stack<object[]>();
+        foreach (var root in roots) {
+            if (root != null) { stack.Push(new object[] { null, null, root }); }
+        }
+        while (stack.Count > 0) {
+            var frame = stack.Pop();
+            var node = frame[2];
+            if (node == null) { continue; }
+            var ht = node as System.Collections.IDictionary;
+            if (ht != null) {
+                if (visited.Add(node)) {
+                    if (ht.Contains("~C")) { pending.Add(frame); }
+                    foreach (System.Collections.DictionaryEntry e in ht) {
+                        if (e.Value != null) { stack.Push(new object[] { ht, e.Key, e.Value }); }
+                    }
+                }
+            } else {
+                var arr = node as System.Array;
+                if (arr != null) {
+                    if (visited.Add(node)) {
+                        for (int i = 0; i < arr.Length; i++) {
+                            if (arr.GetValue(i) != null) { stack.Push(new object[] { arr, i, arr.GetValue(i) }); }
+                        }
+                    }
+                } else {
+                    PSObject pso = node as PSObject;
+                    if (pso != null && !(node is System.Management.Automation.PSCustomObject)) { pso = null; }
+                    // Only descend into PSCustomObject instances (deserialized class-ish shapes);
+                    // other PSObject wrappers unwrap to their BaseObject elsewhere
+                    if (pso == null && node is System.Management.Automation.PSCustomObject) {
+                        pso = (PSObject)node;
+                    }
+                    if (pso != null && visited.Add(node)) {
+                        foreach (var prop in pso.Properties) {
+                            if (prop.IsSettable && prop.Value != null) { stack.Push(new object[] { pso, prop.Name, prop.Value }); }
+                        }
+                    }
+                }
+            }
+        }
+        return pending;
+    }
+
+    // Fast C# replacement for the slow PowerShell rehydration in TryRehydrateScriptBlock:
+    // creates a live class instance and maps hashtable properties via reflection.
+    // conversion via LanguagePrimitives preserves PowerShell assignment semantics.
+    // Returns null when not applicable/possible - the caller then falls back to the PS scriptblock.
+    public static object RehydrateClassNode(System.Collections.IDictionary node, System.Func<string, System.Type> resolver) {
+        if (node == null) { return null; }
+        string className = node["~C"] as string;
+        if (className == null) { return null; }
+        if (resolver == null) { return null; }
+        Type targetType = null;
+        try { targetType = resolver(className); } catch { targetType = null; }
+        if (targetType == null) { return null; }
+        object instance = null;
+        try {
+            instance = System.Activator.CreateInstance(targetType);
+        } catch {
+            instance = null;
+        }
+        if (instance == null) { return null; }
+        bool mapped = false;
+        foreach (System.Collections.DictionaryEntry e in node) {
+            string k = e.Key as string;
+            if (k == null || k == "~C") { continue; }
+            PropertyInfo prop = targetType.GetProperty(k, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+            if (prop != null && prop.CanWrite) {
+                try {
+                    object converted = System.Management.Automation.LanguagePrimitives.ConvertTo(e.Value, prop.PropertyType);
+                    if (converted != null || !prop.PropertyType.IsValueType) { prop.SetValue(instance, converted); }
+                    mapped = true;
+                } catch {
+                    // Skip properties that fail conversion instead of aborting the whole instance
+                }
+            }
+        }
+        // If the type exposes a LoadFromData method, let it rebuild derived/internal state
+        // (e.g. hidden caches like RollingSet.nodeDict) from the raw property map
+        bool loaded = false;
+        MethodInfo loadFromData = targetType.GetMethod("LoadFromData", BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+        if (loadFromData != null && loadFromData.GetParameters().Length == 1) {
+            try {
+                object ret = loadFromData.Invoke(instance, new object[] { node });
+                if (ret is bool && (bool)ret) { loaded = true; }
+            } catch { }
+        }
+        if (!mapped && !loaded) { return null; }
+        return instance;
+    }
 
     // Fast C# replacement for the slow PowerShell copy loops in Clone() and the save snapshot:
     // builds a case-insensitive Hashtable from any IDictionary (hashtable, ConcurrentDictionary,
@@ -522,7 +627,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
 }
 # Verify the loaded converter actually contains the static helpers the load path depends on.
 # Catches a file where the C# converter edits were not applied (methods missing after compilation).
-foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable') {
+foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode') {
     if (-not [PSObjectJsonConverter].GetMethod($requiredConverterMethod, [System.Reflection.BindingFlags]'Public, Static')) {
         throw "PSObjectJsonConverter is missing static method '$requiredConverterMethod' - the C# converter edits were not applied to this file. Apply them, then restart the PowerShell session and run again."
     }
@@ -1408,46 +1513,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     # full-tree traversal is the most expensive post-load step for large class-free datasets.
     # Nodes are appended in DFS order (containers before children); the event action processes the list
     # in reverse so nested instances are rehydrated before their containers copy them out of raw hashtables.
-    $pending = [System.Collections.Generic.List[object]]::new()
-    if (-not [PSObjectJsonConverter]::HasReadClassMarkers()) {
-        $loadResult['PendingClassNodes'] = $pending
-        return $loadResult
-    }
-    $visited = [System.Collections.Generic.HashSet[object]]::new()
-    $stack = [System.Collections.Generic.Stack[hashtable]]::new()
-    foreach ($root in @($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT)) {
-        if ($null -ne $root) { $stack.Push(@{ Parent = $null; Slot = $null; Node = $root; Phase = 0 }) }
-    }
-    while ($stack.Count -gt 0) {
-        $frame = $stack.Pop()
-        $node = $frame.Node
-        if ($null -eq $node) { continue }
-        if ($node -is [System.Collections.IDictionary]) {
-            $wasVisited = -not $visited.Add($node)
-            if (-not $wasVisited) {
-                if ($node['~C'] -is [string]) { $pending.Add(@{ Parent = $frame.Parent; Slot = $frame.Slot; Node = $node }) }
-                foreach ($k in @($node.Keys)) {
-                    $child = $node[$k]
-                    if ($null -ne $child) { $stack.Push(@{ Parent = $node; Slot = $k; Node = $child; Phase = 0 }) }
-                }
-            }
-        } elseif ($node -is [System.Array]) {
-            $wasVisited = -not $visited.Add($node)
-            if (-not $wasVisited) {
-                for ($i = 0; $i -lt $node.Length; $i++) {
-                    $child = $node[$i]
-                    if ($null -ne $child) { $stack.Push(@{ Parent = $node; Slot = $i; Node = $child; Phase = 0 }) }
-                }
-            }
-        } elseif ($node -is [pscustomobject]) {
-            $wasVisited = -not $visited.Add($node)
-            if (-not $wasVisited) {
-                foreach ($p in @($node.PSObject.Properties)) {
-                    if ($p.IsSettable -and $null -ne $p.Value) { $stack.Push(@{ Parent = $node; Slot = $p.Name; Node = $p.Value; Phase = 0 }) }
-                }
-            }
-        }
-    }
+    $pending = [PSObjectJsonConverter]::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
     $loadResult['PendingClassNodes'] = $pending
     return $loadResult
 } # End of LoadAsyncScriptBlock
@@ -2117,18 +2183,45 @@ Class HashTableDB1 {
             # Restore PS class instances ('~C' markers) only when the converter detected class markers in the
             # loaded files. Skipping the full-tree traversal is the main load-time optimization for class-free
             # datasets. Runs in the current session where user classes are defined, not in the async runspace.
+            # C# traversal + C# rehydration with a PS fallback (parameterless-ctor types are handled natively;
+            # exotic constructors fall back to the PS TryRehydrate scriptblock).
             if ($loadResult.ClassMarkersFound) {
-                if ($null -ne $loadResult.MainHT) { $loadResult.MainHT = & $Script:HashtableDB1Class_RestoreClassesScriptBlock $loadResult.MainHT }
-                if ($null -ne $loadResult.UpdatesHT) { $loadResult.UpdatesHT = & $Script:HashtableDB1Class_RestoreClassesScriptBlock $loadResult.UpdatesHT }
-                if ($null -ne $loadResult.DatabaseParamsHT) { $loadResult.DatabaseParamsHT = & $Script:HashtableDB1Class_RestoreClassesScriptBlock $loadResult.DatabaseParamsHT }
+                $converterType = 'PSObjectJsonConverter' -as [type]
+                # Standard workaround for class method bodies: NO [PSObjectJsonConverter+...] type literals
+                # here - class methods bind type literals at compile time, before Add-Type has executed.
+                # System.Func is a BCL type (always resolvable); the scriptblock converts to the delegate at runtime.
+                $typeResolver = [Func[string,Type]] { param($className) $className -as [type] }
+                foreach ($rootHT in @($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT)) {
+                    if ($null -eq $rootHT) { continue }
+                    $pendingNodes = $converterType::CollectClassNodes(@($rootHT))
+                    for ($i = $pendingNodes.Count - 1; $i -ge 0; $i--) {
+                        $frame = $pendingNodes[$i]
+                        $node = $frame[2]
+                        $rehydrated = $converterType::RehydrateClassNode($node, $typeResolver)
+                        if ($null -eq $rehydrated) { $rehydrated = & $Script:HashtableDB1Class_TryRehydrateScriptBlock $node }
+                        if ($null -eq $rehydrated) { continue }
+                        $parent = $frame[0]
+                        if ($null -eq $parent) {
+                            # Root itself was a class node: replace the root reference in the result
+                            if ([object]::ReferenceEquals($rootHT, $loadResult.MainHT)) { $loadResult.MainHT = $rehydrated }
+                            elseif ([object]::ReferenceEquals($rootHT, $loadResult.UpdatesHT)) { $loadResult.UpdatesHT = $rehydrated }
+                            elseif ([object]::ReferenceEquals($rootHT, $loadResult.DatabaseParamsHT)) { $loadResult.DatabaseParamsHT = $rehydrated }
+                            continue
+                        }
+                        $slot = $frame[1]
+                        if ($parent -is [System.Collections.IDictionary]) { $parent[$slot] = $rehydrated }
+                        elseif ($parent -is [System.Array]) { $parent[$slot] = $rehydrated }
+                        else { try { $parent."$slot" = $rehydrated } catch { } }
+                    }
+                }
             }
-            # Build all CDs as local variables, then assign atomically to prevent concurrent readers from seeing
-            # partially populated collections. C# helpers replace the slow PowerShell copy loops.
-            # NOTE: the converter type MUST be resolved at runtime ('-as [type]'). Class bodies bind type
-            # literals at compile time - before Add-Type at the top of this file has executed - so a direct
-            # [PSObjectJsonConverter] reference here fails to compile in a fresh session.
+            # Runtime type resolution for dictionary builders (kept from the previous optimization)
             $converterType = 'PSObjectJsonConverter' -as [type]
             if (-not $converterType) { throw "PSObjectJsonConverter type is not loaded. Add-Type failed or was skipped." }
+            # Build all CDs as local variables, then assign atomically to prevent concurrent readers from seeing
+            # partially populated collections. C# helpers replace the slow PowerShell copy loops.
+            # NOTE: the converter type must be resolved at runtime ('-as [type]') - class method bodies
+            # bind type literals at compile time, before Add-Type at the top of this file has executed.
             if ($null -ne $loadResult.MainHT) {
                 $this.MainHT = $converterType::BuildConcurrentDictionary($loadResult.MainHT, $null)
             }
@@ -2277,6 +2370,9 @@ Class HashTableDB1 {
                 asyncResult  = $asyncResult
                 # Pass the rehydrate scriptblock explicitly: Script: scope may be unavailable inside the event job
                 tryRehydrateScriptBlock = $Script:HashtableDB1Class_TryRehydrateScriptBlock
+                # Converter type name resolved at runtime inside the event action (class literal is
+                # unavailable there): RehydrateClassNode / CollectClassNodes fast path for '~C' nodes
+                converterTypeName = 'PSObjectJsonConverter'
             }
             $this.AsynchronousLoadOperationState.PSEventJob = Register-ObjectEvent -InputObject $PSInstance -EventName InvocationStateChanged -Action {
                 $PSInstance = $event.Sender
@@ -2303,15 +2399,23 @@ Class HashTableDB1 {
                         # ConcurrentDictionaries (built in Phase 2 before rehydration ran).
                         $restoreSB = $messageData.tryRehydrateScriptBlock
                         $pendingNodes = $loadResult.PendingClassNodes
-                        if ($restoreSB -and $pendingNodes -and $pendingNodes.Count -gt 0) {
+                        if ($pendingNodes -and $pendingNodes.Count -gt 0) {
+                            # C# rehydration first (fast path), PS scriptblock as fallback for exotic
+                            # constructors. The type resolver is a PS delegate because user classes
+                            # are only resolvable in this (main session) context.
+                            $converterType = 'PSObjectJsonConverter' -as [type]
+                            # Same class-body workaround: BCL Func type literal, scriptblock converts at runtime
+                            $typeResolver = [Func[string,Type]] { param($className) $className -as [type] }
                             $mainHTRaw = $loadResult.MainHT
                             $updatesHTRaw = $loadResult.UpdatesHT
                             for ($i = $pendingNodes.Count - 1; $i -ge 0; $i--) {
                                 $frame = $pendingNodes[$i]
-                                $rehydrated = & $restoreSB $frame.Node
-                                if ($null -eq $rehydrated -or $null -eq $frame.Parent) { continue }
-                                $parent = $frame.Parent
-                                $slot = $frame.Slot
+                                $node = $frame[2]
+                                $rehydrated = $converterType::RehydrateClassNode($node, $typeResolver)
+                                if ($null -eq $rehydrated -and $restoreSB) { $rehydrated = & $restoreSB $node }
+                                if ($null -eq $rehydrated -or $null -eq $frame[0]) { continue }
+                                $parent = $frame[0]
+                                $slot = $frame[1]
                                 $slotKey = [string]$slot
                                 if ([object]::ReferenceEquals($parent, $mainHTRaw)) {
                                     # Top-level main value: patch MainHT; merged only when not overridden by updates/removals

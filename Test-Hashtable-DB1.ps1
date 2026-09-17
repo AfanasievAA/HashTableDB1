@@ -30,6 +30,7 @@
  $projectTmp = Join-Path $projectRoot "tmp"
  $ClassFile = Join-Path $projectSource "HashtableDB1-Class.ps1"
  $StorageFormatToTest = 'xml'
+# $StorageFormatToTest = 'json'
 if (-not (Test-Path $ClassFile)) {
     Write-Error "Class file not found: $ClassFile"
     exit 1
