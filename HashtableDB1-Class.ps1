@@ -6,9 +6,9 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 This class is designed for high-load scenarios. It maintains three internal dictionaries: MainHT, UpdatesHT, and RemovedHT. A MergedHT provides a real-time unified view. NEVER modify the internal dictionaries directly; use the class methods. Despite method names containing "XML" (for historical compatibility), the actual persistence format is JSON.
 
 .NOTES
-  Version:        1.25
+  Version:        1.26
   Author:         Andrew Afanasiev
-  Date:           17 Sep 2026
+  Date:           21 Sep 2026
   Contacts:       AfanasievAA@yandex.ru
   !!!! NO Vibecoding here please !!!! This is heavily loaded and intense script. Any wrong "optimization" proposed by your favorite AI will probably end up in data loss! I'm not joking folks. Use your own head before committing any changes to this script.
   If you feel lucky enough to modify this, there are 3 test scripts which you can find and code_testing folder. Fire them up after your modification. Run one by one and ensure there are NO errors in any test, or else you'll end up in data loss.
@@ -146,10 +146,28 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         });
     }
 
-    // Max recursion depth to prevent StackOverflowException on circular object references
+    // Max recursion depth to prevent StackOverflowException on circular object references.
+    // Cycles (e.g. LinkedList<->LinkedListNode in RollingSet.nodeDict) are cut off here and written
+    // as the "__MAX_DEPTH_REACHED__" string marker, keeping the save alive instead of failing.
     private const int MaxDepth = 100;
+    // The underlying Utf8JsonWriter has its OWN default MaxDepth of 64. Deep-but-finite graphs
+    // (migrated CLIXML Deserialized.* wrapper chains) can legitimately exceed 64 before the
+    // converter-level guard fires, so the writer limit must be raised above MaxDepth to make the
+    // converter guard the single effective depth control.
+    private const int WriterMaxDepth = 128;
     // Thread-static depth tracker to avoid thread contention and locks during serialization
     [ThreadStatic] private static int _currentDepth;
+    // Active-serialization stack (per converter instance): reference-identity set of containers
+    // currently being serialized. A revisit means a circular reference (e.g. LinkedList <->
+    // LinkedListNode inside RollingSet.nodeDict) - writing the "__CYCLE__" marker instead of
+    // expanding keeps serialization linear; a depth cap alone cannot bound a cyclic graph
+    // (branching references unroll exponentially and exhaust memory before any cap fires).
+    private readonly HashSet<object> _activeObjects = new HashSet<object>(ReferenceEqualityComparer.Instance);
+    // Circuit breaker: total container nodes serialized by this converter instance. Pathological
+    // graphs (cyclic through untracked paths, or heavily shared DAG references) expand
+    // exponentially; the budget converts an OutOfMemoryException into a clean, diagnosable error.
+    private const long MaxSerializedNodes = 20000000;
+    private long _serializedNodes = 0;
     // Thread-static flag set by Read when a '~C' class marker is encountered. Lets PowerShell skip the
     // expensive full-tree RestoreClasses traversal for data guaranteed to contain no class instances.
     [ThreadStatic] private static bool _sawClassMarker;
@@ -430,25 +448,64 @@ public class PSObjectJsonConverter : JsonConverter<object> {
     }
 
     // Entry point for serialization. Manages depth tracking to prevent infinite loops.
+    // DIAGNOSTICS: System.Text.Json wraps any non-JsonException thrown by a converter into a generic
+    // JsonException ("The object or value could not be serialized. Path: $.") that hides the real
+    // cause in InnerException - and the path is always "$." because this converter serializes the
+    // whole graph itself. Rethrowing as JsonException with the failing value's TYPE builds a chain
+    // from root to culprit (JsonException passes through the STJ wrapper unwrapped), so the
+    // innermost message names the exact type that could not be serialized.
     public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options) {
         if (value == null) { writer.WriteNullValue(); return; }
+        // Cycle guard: only reference-type containers are tracked (scalars cannot cycle, and
+        // tracking millions of unique strings would waste memory). A revisit while the object is
+        // still on the serialization stack = circular reference -> cut it with a marker.
+        bool tracked = false;
+        if (value is PSObject || value is System.Collections.IDictionary || value is System.Collections.IList) {
+            if (_activeObjects.Contains(value)) {
+                writer.WriteStringValue("__CYCLE__");
+                return;
+            }
+            _activeObjects.Add(value);
+            tracked = true;
+            _serializedNodes++;
+            if (_serializedNodes > MaxSerializedNodes) {
+                _activeObjects.Remove(value);
+                throw new JsonException("PSObjectJsonConverter: serialization node budget ("
+                    + MaxSerializedNodes + ") exceeded - the object graph is pathologically large "
+                    + "(circular or heavily shared references, e.g. live LinkedList/LinkedListNode inside a class). "
+                    + "Failing value type: '" + value.GetType().FullName + "'.");
+            }
+        }
         if (_currentDepth > MaxDepth) {
+            if (tracked) { _activeObjects.Remove(value); }
             writer.WriteStringValue("__MAX_DEPTH_REACHED__");
             return;
         }
         _currentDepth++;
         try {
             WriteInternal(writer, value, options);
+        } catch (JsonException) {
+            throw; // already enriched by a deeper recursion level
+        } catch (Exception ex) {
+            throw new JsonException("PSObjectJsonConverter failed to serialize a value of type '"
+                + value.GetType().FullName + "': " + ex.Message, ex);
         } finally {
             _currentDepth--;
+            if (tracked) { _activeObjects.Remove(value); }
         }
     }
-
+        
     // Core serialization logic. Unwraps PSObject and maps types to JSON efficiently.
     private void WriteInternal(Utf8JsonWriter writer, object value, JsonSerializerOptions options) {
         if (value == null) { writer.WriteNullValue(); return; }
 
-        // Unwrap PSObject only when NOT PSCustomObject, otherwise we'd lose deserialized properties
+        // Unwrap PSObject only when NOT PSCustomObject, otherwise we'd lose deserialized properties.
+        // A PSObject whose BaseObject is a raw Hashtable is a deserialization half-product with the
+        // entries stored INSIDE the BaseObject (PSSerializer.Deserialize materializes it this way).
+        // It MUST be unwrapped: the kind=1 dictionary branch below then serializes the entries.
+        // Keeping it wrapped would send it to the PSObject property-map branch, which enumerates the
+        // .NET reflection properties of the Hashtable CLASS (Count/Keys/Values/SyncRoot) instead of
+        // the dictionary entries - losing all payload fields.
         if (value is PSObject) {
             PSObject psoVal = (PSObject)value;
             if (!(psoVal.BaseObject is PSObject) && psoVal.BaseObject.GetType() != typeof(System.Management.Automation.PSCustomObject)) {
@@ -617,7 +674,15 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     writer.WriteStringValue(clixml);
                     writer.WriteEndObject();
                 } catch {
-                    writer.WriteStringValue(value.ToString());
+                    // Last-resort: NEVER stringify containers (IDictionary/IList/PSObject) - their
+                    // ToString() is a debug dump ("@{A=1; B=2}") that loses all nested data and
+                    // deserializes as a useless string value. Write a null instead so the loss is
+                    // visible instead of silently corrupted (a string that pretends to be an object).
+                    if (value is PSObject || value is System.Collections.IDictionary || value is System.Collections.IList) {
+                        writer.WriteNullValue();
+                    } else {
+                        writer.WriteStringValue(value.ToString());
+                    }
                 }
             }
         }
@@ -707,10 +772,16 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     }
     try {
         $startDateTime = [System.Datetime]::Now
+        # DIAGNOSTICS: coarse stage marker, included in the error message when the save fails
+        $saveStage = 'init'
         $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
         $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
         # Disable escaping of <, > and non-ASCII to reduce JSON size
         $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+        # Raise the writer depth limit above the converter's own MaxDepth (100): deep-but-finite
+        # graphs (migrated CLIXML wrapper chains) exceed the writer default of 64 before the
+        # converter-level circular-reference guard fires, which aborts the whole save
+        $jsonOptions.MaxDepth = 128
         # Storage format: 'Json' (default) or 'Xml' (CLIXML compatibility mode). All file names are
         # parameterized by extension so the folder always holds files of a single format.
         if ($thisObj.StorageFormat -notin @('Json','Xml')) { throw "Invalid StorageFormat '$($thisObj.StorageFormat)' - use 'Json' or 'Xml'." }
@@ -721,6 +792,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $tmpDeletes = $null
         # New data is saved to *.tmp files. Main file saved only if modified
         if ($thisObj.IsForceSaveMain) {
+            $saveStage = 'main-serialize'
             $tmpMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext.tmp"
             if ($ext -eq 'xml') {
                 # CLIXML compatibility mode. Explicit depth is required: the parameterless Serialize
@@ -738,6 +810,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 }
             }
         }
+        $saveStage = 'updates-serialize'
         $tmpUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext.tmp"
         if ($ext -eq 'xml') {
             # CLIXML compatibility mode (explicit depth - see the main-file block above)
@@ -756,6 +829,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $removedForSave = [PSObjectJsonConverter]::BuildHashtable($removedSnap)
         # Database parameters travel inside the deletes snapshot (read back by the load path)
         $removedForSave["___DATABASEPARAMS___"] = $thisObj.DatabaseParamsHT
+        $saveStage = 'deletes-serialize'
         $tmpDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext.tmp"
         if ($ext -eq 'xml') {
             # CLIXML compatibility mode (explicit depth - see the main-file block above)
@@ -773,6 +847,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $updatesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext"
         $deletesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext"
         # Renaming current files to OLD if they are present.
+        $saveStage = 'rename-swap'
         if ($thisObj.IsForceSaveMain -and [System.IO.File]::Exists($mainJson)) {
             $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.old"
             _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($mainJson, $dest) }
@@ -855,7 +930,22 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     } catch {
         $thisObj.AsyncResults['Success'] = $false
         $thisObj.AsyncResults['Error']   = $_
-        $thisObj.AsyncResults['Message'] = "Async save error: $($_.Exception.Message)"
+        # DIAGNOSTICS: unwrap the full inner-exception chain. System.Text.Json hides the real cause
+        # of converter failures inside InnerException (outer message: "The object or value could not
+        # be serialized. Path: $."), and the default .Message shows only that generic wrapper.
+        # The chain levels carry the value types from the C# Write diagnostics - the innermost
+        # level names the exact type that failed.
+        $errChain = $_.Exception.Message
+        $innerEx = $_.Exception.InnerException
+        $chainDepth = 0
+        while ($null -ne $innerEx -and $chainDepth -lt 15) {
+            $chainDepth++
+            $errChain += "`n  ---> [$chainDepth] $($innerEx.GetType().FullName): $($innerEx.Message)"
+            $innerEx = $innerEx.InnerException
+        }
+        if ($saveStage) { $errChain += "`nStage: $saveStage" }
+        if ($_.ScriptStackTrace) { $errChain += "`nScriptStackTrace:`n$($_.ScriptStackTrace)" }
+        $thisObj.AsyncResults['Message'] = "Async save error: $errChain"
         # Cleanup tmp files on error to prevent orphans
         foreach($p in @($tmpMain,$tmpUpdates,$tmpDeletes)){
             if ($p -and [System.IO.File]::Exists($p)) {
@@ -883,6 +973,9 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
 
         $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
         $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
+        # Writer depth limit aligned with the save path - a valid file saved with deep graphs
+        # must deserialize without tripping the default reader/writer depth of 64
+        $jsonOptions.MaxDepth = 128
         # Reset '~C' detection so the result can report whether any class instances exist in this load batch
         [PSObjectJsonConverter]::ResetClassMarkerDetection()
 
@@ -1273,6 +1366,8 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
     # Disable escaping of <, > and non-ASCII to reduce TxLog size
     $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    # Writer depth limit aligned with the save path (see the save scriptblock for the rationale)
+    $jsonOptions.MaxDepth = 128
     # 1MB write buffer: fewer larger write syscalls for big delta batches
     $stream = [System.IO.File]::Create($fullPath, 1048576)
     try {

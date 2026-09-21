@@ -29,8 +29,8 @@
  $projectRoot = Resolve-Path "$($projectSource)"
  $projectTmp = Join-Path $projectRoot "tmp"
  $ClassFile = Join-Path $projectSource "HashtableDB1-Class.ps1"
- $StorageFormatToTest = 'xml'
-# $StorageFormatToTest = 'json'
+ $StorageFormatToTest = 'json'
+# $StorageFormatToTest = 'xml'
 if (-not (Test-Path $ClassFile)) {
     Write-Error "Class file not found: $ClassFile"
     exit 1
@@ -353,7 +353,62 @@ foreach ($item in $Script:Data50) { $db2.Add($item.Key, $item.Value) }
         Tags      = [System.Collections.ArrayList]@('tag1','tag2')
         Nested    = @{ DeepKey = 'DeepValue'; DeepNum = [long]1234567890 }
     }
+    # Certificate-database shape: hashtable with int keys holding certificate PSCustomObjects
+    'mt_CertContainer' = @{
+        Email              = 'test@domain.local'
+        CertificateCounter = 1
+        Certificates       = @{
+            61758 = [pscustomobject]@{
+                SrvIdx                = 1
+                RequestID             = 61758
+                Email                 = 'test@domain.local'
+                Subject               = 'E=test@domain.local, CN=Test User, C=RU'
+                Issuer                = 'CN=CA'
+                NotBefore             = [datetime]'2025-08-03 16:31:52'
+                NotAfter              = [datetime]'2027-08-03 16:41:52'
+                SerialNumber          = '780000F13EAB958C9144877F0200000000F13E'
+                Thumbprint            = 'FDA593F6DB8D694A0B16744362D8187D5E2CF4F3'
+                Algorithm             = 'sha256RSA'
+                KeyUsageId            = [string[]]@('1.3.6.1.5.5.7.3.2')
+                ResolvedWhen          = [datetime]'2025-08-03 08:41:52'
+                RevokedEffectiveWhen  = $null
+                AlternativeNames      = [System.Collections.Generic.List[string]]@('test@domain.local')
+            }
+        }
+        SmartCardLogonCertificateCount = 0
+    }
 }
+
+# Deserialization half-product: the same certificate shape, but as a PSObject wrapping a raw
+# Hashtable (exactly what PSSerializer.Deserialize materializes for PSCustomObject values).
+# Regression case: the old WriteInternal unwrapped it to Hashtable, the complex-type fallback
+# then stringified it via ToString() as "@{SrvIdx=1; ...}" and load returned a plain string.
+ $certRaw = @{
+    SrvIdx                = 1
+    RequestID             = 61759
+    Email                 = 'test@domain.local'
+    Subject               = 'E=test@domain.local, CN=Test User 2, C=RU'
+    Issuer                = 'CN=CA'
+    NotBefore             = [datetime]'2025-08-03 16:31:52'
+    NotAfter              = [datetime]'2027-08-03 16:41:52'
+    SerialNumber          = '780000F13EAB958C9144877F0200000000F13F'
+    Thumbprint            = 'FDA593F6DB8D694A0B16744362D8187D5E2CF4F4'
+    Algorithm             = 'sha256RSA'
+    KeyUsageId            = @('1.3.6.1.5.5.7.3.2')
+    ResolvedWhen          = [datetime]'2025-08-03 08:41:52'
+    RevokedEffectiveWhen  = $null
+    AlternativeNames      = [System.Collections.Generic.List[string]]@('test@domain.local')
+}
+# Added AFTER the literal is closed: assignments are not allowed inside a hashtable literal
+ $mixedTypes['mt_CertContainerWrapped'] = @{
+    Email              = 'test@domain.local'
+    CertificateCounter = 1
+    Certificates       = @{
+        61759 = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($certRaw))
+    }
+    SmartCardLogonCertificateCount = 0
+}
+
 foreach ($k in $mixedTypes.Keys) { $db2.Add($k, $mixedTypes[$k]) }
 
  $snapshot2 = $db2.Clone()
@@ -363,7 +418,7 @@ foreach ($k in $mixedTypes.Keys) { $db2.Add($k, $mixedTypes[$k]) }
  $db2.SaveToDisk()
  $sw.Stop()
  $memAfter = Get-CurrentMemoryMB
-Add-TestMetric -TestName "Test 2" -Operation "SaveToDisk" -Context "Synchronously saves the current database state (main, updates, deletes) into JSON files including records with various PowerShell data types (strings, numerics, DateTime, TimeSpan, Guid, char, byte, arrays, ArrayList, hashtables, PSCustomObjects, nested structures) to test standard persistence and serialization fidelity. Format for all save/load tests: $StorageFormatToTest" -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
+Add-TestMetric -TestName "Test 2" -Operation "SaveToDisk" -Context "Synchronously saves the current database state (main, updates, deletes) into JSON files including records with various PowerShell data types (strings, numerics, DateTime, TimeSpan, Guid, char, byte, arrays, ArrayList, hashtables, PSCustomObjects, nested structures) plus a certificate-database shape (int-keyed Certificates hashtable with certificate PSCustomObjects, incl. a deserialization-wrapped half-product) to test standard persistence and serialization fidelity. Format for all save/load tests: $StorageFormatToTest" -ElapsedSeconds $sw.Elapsed.TotalSeconds -MemBeforeMB $memBefore -MemAfterMB $memAfter
 
  $db2b = New-TestDB -Folder $folder2 -BackupCount 2
  $sw.Restart()
@@ -375,7 +430,7 @@ Add-TestMetric -TestName "Test 2" -Operation "LoadFromDisk" -Context "Synchronou
  $strictTypeOk = $true
  $loadedPso = $db2b.Get('mt_PSCustomObject')
 if ($loadedPso -isnot [pscustomobject]) {
-    Write-Host "FAIL: Strict type mismatch for mt_PSCustomObject. Expected PSCustomObject, got $($loadedPso.GetType().Name)" -ForegroundColor Red
+    Write-Host "FAIL: Strict type mismatch for mt_PSCustomObject. Expected PSCustomObject, got $(if ($null -ne $loadedPso) { $loadedPso.GetType().Name } else { 'null' })" -ForegroundColor Red
     $strictTypeOk = $false
 }
  $loadedDt2 = $db2b.Get('mt_DateTime')
@@ -402,9 +457,6 @@ if ($loadedDecimal -isnot [decimal]) {
 # Format-agnostic: the container type of an empty array is format-dependent (Json -> object[],
 # CLIXML -> ArrayList, possibly PSObject-wrapped). The guarded regression is "the empty array
 # survived as a non-null empty collection and did not collapse to $null" - so check exactly that.
-# NOTE: no intermediate variable - an 'if' expression assignment streams its output through the
-# pipeline, which enumerates an empty collection into zero items and collapses it to $null (the
-# same gotcha RestoreClassesScriptBlock guards against with its comma-wrapped return).
 if ($null -eq $loadedEmptyArray -or @($loadedEmptyArray).Count -ne 0) {
     Write-Host "FAIL: mt_EmptyArray lost. Expected empty array, got $(if ($null -ne $loadedEmptyArray) { $loadedEmptyArray.GetType().Name } else { 'null' })" -ForegroundColor Red
     $strictTypeOk = $false
@@ -415,11 +467,78 @@ if ($loadedEmptyHash -isnot [hashtable] -or $loadedEmptyHash.Count -ne 0) {
     $strictTypeOk = $false
 }
 
+# Certificate-database regression: int-keyed Certificates hashtable + certificate PSCustomObject
+ $loadedCertCont = $db2b.Get('mt_CertContainer')
+ $certOk = $true
+if ($loadedCertCont -isnot [hashtable] -or -not ($loadedCertCont.Certificates -is [System.Collections.IDictionary])) {
+    Write-Host "FAIL: mt_CertContainer structure lost (hashtable with Certificates dictionary)" -ForegroundColor Red
+    $certOk = $false
+} else {
+    $loadedCert = $loadedCertCont.Certificates[61758]
+    if ($loadedCert -is [string]) {
+        Write-Host "FAIL: certificate value round-tripped as a STRING (ToString() corruption)" -ForegroundColor Red
+        $certOk = $false
+    }
+    if ($loadedCert -isnot [pscustomobject]) {
+        Write-Host "FAIL: certificate value expected PSCustomObject, got $(if ($null -ne $loadedCert) { $loadedCert.GetType().Name } else { 'null' })" -ForegroundColor Red
+        $certOk = $false
+    } else {
+        if ($loadedCert.RequestID -isnot [int] -or $loadedCert.RequestID -ne 61758) {
+            Write-Host "FAIL: certificate RequestID not restored as [int]" -ForegroundColor Red
+            $certOk = $false
+        }
+        if ($loadedCert.NotBefore -isnot [datetime] -or $loadedCert.NotBefore -ne [datetime]'2025-08-03 16:31:52') {
+            Write-Host "FAIL: certificate NotBefore not restored as DateTime" -ForegroundColor Red
+            $certOk = $false
+        }
+        if (@($loadedCert.KeyUsageId).Count -ne 1 -or "$($loadedCert.KeyUsageId[0])" -ne '1.3.6.1.5.5.7.3.2') {
+            Write-Host "FAIL: certificate KeyUsageId array collapsed (count: $(@($loadedCert.KeyUsageId).Count))" -ForegroundColor Red
+            $certOk = $false
+        }
+        if ($null -ne $loadedCert.RevokedEffectiveWhen) {
+            Write-Host "FAIL: certificate RevokedEffectiveWhen should be null" -ForegroundColor Red
+            $certOk = $false
+        }
+        if (@($loadedCert.AlternativeNames).Count -ne 1) {
+            Write-Host "FAIL: certificate AlternativeNames lost" -ForegroundColor Red
+            $certOk = $false
+        }
+    }
+}
+
+# Wrapped-certificate regression (deserialization half-product: PSObject over raw Hashtable)
+ $loadedWrapped = $db2b.Get('mt_CertContainerWrapped')
+if ($loadedWrapped -isnot [hashtable] -or -not ($loadedWrapped.Certificates -is [System.Collections.IDictionary])) {
+    Write-Host "FAIL: mt_CertContainerWrapped structure lost" -ForegroundColor Red
+    $certOk = $false
+} else {
+    $loadedWrappedCert = $loadedWrapped.Certificates[61759]
+    if ($loadedWrappedCert -is [string]) {
+        # The exact production corruption: "@{SrvIdx=1; RequestID=61759; ...}" as a plain string
+        Write-Host "FAIL: WRAPPED certificate stringified via ToString() and round-tripped as a STRING" -ForegroundColor Red
+        $certOk = $false
+    }
+    if ($loadedWrappedCert -isnot [pscustomobject] -and $loadedWrappedCert -isnot [hashtable]) {
+        Write-Host "FAIL: wrapped certificate expected PSCustomObject/hashtable, got $(if ($null -ne $loadedWrappedCert) { $loadedWrappedCert.GetType().Name } else { 'null' })" -ForegroundColor Red
+        $certOk = $false
+    } else {
+        $wrappedKeyId = $loadedWrappedCert.KeyUsageId
+        if (@($wrappedKeyId).Count -lt 1 -or "$(@($wrappedKeyId)[0])" -ne '1.3.6.1.5.5.7.3.2') {
+            Write-Host "FAIL: wrapped certificate KeyUsageId lost or collapsed" -ForegroundColor Red
+            $certOk = $false
+        }
+        if ("$($loadedWrappedCert.SerialNumber)" -notlike '780000F13EAB958C9144877F0200000000F13F') {
+            Write-Host "FAIL: wrapped certificate SerialNumber mismatch" -ForegroundColor Red
+            $certOk = $false
+        }
+    }
+}
+if (-not $certOk) { $strictTypeOk = $false }
+
 # Deep comparison of the full snapshot: checks values. 
 # NOTE: Compare-DbValues may do loose comparisons, so strict type checks above are required to catch type loss regressions.
  $typeTestOk = Compare-DbValues -Expected $snapshot2 -Actual $db2b.Clone() -Path 'Root.'
 if (-not $ok -or -not $typeTestOk -or -not $strictTypeOk) { Write-Host "FAIL: Sync Save/Load mismatch on mixed types or strict type violation" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Sync Save/Load with Mixed Types OK" -ForegroundColor Green }
-
 # 2.3 Test 3 - Async Save vs Sync Save
 Write-Host "`n=== Test 3 - SaveToDiskAsync vs SaveToDisk ===" -ForegroundColor Cyan
  $folder3 = Join-Path $BasePath '03_AsyncSave'
