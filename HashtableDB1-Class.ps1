@@ -3,102 +3,182 @@
 HashTableDB1 is a high-performance, thread-safe, persistent key-value database for PowerShell. It uses ConcurrentDictionary for in-memory operations and automatically persists to JSON files (with legacy XML fallback). It supports synchronous/asynchronous saving/loading, automatic consolidation, backup rotation, and transaction logging.
 
 .DESCRIPTION
-This class is designed for high-load scenarios. It maintains three internal dictionaries: MainHT, UpdatesHT, and RemovedHT. A MergedHT provides a real-time unified view. NEVER modify the internal dictionaries directly; use the class methods. Despite method names containing "XML" (for historical compatibility), the actual persistence format is JSON.
+High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly—use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.26
+  Version:        1.28
   Author:         Andrew Afanasiev
-  Date:           21 Sep 2026
-  Contacts:       AfanasievAA@yandex.ru
-  !!!! NO Vibecoding here please !!!! This is heavily loaded and intense script. Any wrong "optimization" proposed by your favorite AI will probably end up in data loss! I'm not joking folks. Use your own head before committing any changes to this script.
-  If you feel lucky enough to modify this, there are 3 test scripts which you can find and code_testing folder. Fire them up after your modification. Run one by one and ensure there are NO errors in any test, or else you'll end up in data loss.
-  For those who did not listen and ruined data. A backup is kept in the OLD subfolder; you can restore it and manually replay changes from the transaction log (TxLog). Do not call me when that happens - You've been warned.
+  Date:           29 Sep 2026
+  Contact:        AfanasievAA@yandex.ru
+  WARNING: Do not apply AI-generated "optimizations" without thorough testing. This is a production-critical database engine. Incorrect changes can cause data loss.
+  Before committing changes: run all 3 test scripts in the code_testing\ folder. All tests must pass with zero errors.
+  Recovery: Backups are stored in the OLD\ subfolder. Transaction logs (TxLog\) allow differential replay. Use at your own risk.
 
 .PROPERTIES
-DatabaseFolderPath [string]      : Directory path for database files. Default: ".\"
-DatabaseFileName [string]        : Base name for the database files. Default: "HashTableDB"
-NumOfDbBackupsToKeep [int]       : Number of backup files to keep in the "OLD" subfolder. 0 = no backups.
-EnableTransactionLog [bool]      : Enables transaction logging for differential sync.
-TxLogRetentionDays [int]         : Days to retain transaction logs. Default: 3.
-DatabaseParamsHT [hashtable]     : Custom metadata hashtable saved alongside the database.
-ReadOnlyMode [bool]              : If true, prevents saving.
-ErrorLevel [string/int]          : 0 on success, error code string on failure.
-ErrorText [string]               : Error description.
-MainFileLoadedDT, UpdatesFileLoadedDT, RemovedFileLoadedDT [DateTime] : Timestamps of loaded files.
-MainHT, UpdatesHT, MergedHT, RemovedHT : Internal thread-safe states. DO NOT MODIFY DIRECTLY.
+DatabaseFolderPath [string]     : Database directory. Default: ".\"
+DatabaseFileName [string]       : Base filename (without extension). Default: "HashTableDB"
+NumOfDbBackupsToKeep [int]      : Backup count in OLD\. 0 = disabled.
+EnableTransactionLog [bool]     : Enable TxLog for incremental sync.
+TxLogRetentionDays [int]        : TxLog retention (days). Default: 3.
+DatabaseParamsHT [hashtable]    : User metadata (persisted in deletes file).
+ReadOnlyMode [bool]             : Block write operations.
+ErrorLevel [string/int]         : 0 = success, code = failure.
+ErrorText [string]              : Error message.
+MainFileLoadedDT, UpdatesFileLoadedDT, RemovedFileLoadedDT [DateTime] : Last load/save timestamps per file.
+MainHT, UpdatesHT, MergedHT, RemovedHT : Internal ConcurrentDictionaries. DO NOT MODIFY.
 
 .METHODS
-[void] CreateEmptyDB() : Clears all internal hashtables and resets state.
-[void] Add($KeyName, $HashValue) : Adds or updates a key with the specified value.
-[void] Remove($KeyName) : Marks a key as removed.
-[void] UpsertNestedHashTableKey($KeyName, $SecondaryKey, $SecondaryKeyValue=1) : Thread-safe upsert of a secondary key inside a hashtable value.
-[void] RemoveNestedHashTableKey($KeyName, $SecondaryKey) : Thread-safe removal of a secondary key.
-[object] Get($KeyName) : Retrieves a value by key.
-[object] GetAllKeys() : Returns all active keys in the database.
-[object] GetAllValues() : Returns all active values.
-[bool] ContainsKey($KeyName) : Checks if a key exists.
-[hashtable] Clone() : Creates a deep copy of the current MergedHT as a standard hashtable.
-[void] CompactDatabase() : Forces merging of UpdatesHT and RemovedHT into MainHT and clears update queues.
-[void] SaveToDisk() : Synchronously saves the database to JSON files.
-[void] SaveToDiskAsync() : Asynchronously saves the database using background runspaces.
-[void] WaitForAsyncSaveToDisk() : Blocks execution until the current async save completes.
-[bool] LoadFromDisk() : Synchronously loads the database from JSON files. Returns $true if data was loaded/updated.
-[void] LoadFromDiskAsync() : Asynchronously loads the database in the background.
-[void] WaitForAsyncLoadFromDisk() : Blocks execution until the current async load completes.
-[void] EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite = $false) : Creates the folder and sets ACLs for a specific SID.
-[void] Dispose() : Waits for async operations, cleans up runspaces, and clears memory.
+[void] CreateEmptyDB()          : Reset all HTs and state.
+[void] Add($Key, $Value)        : Add/update key.
+[void] Remove($Key)             : Mark key as deleted.
+[void] UpsertNestedHashTableKey($Key, $SecondaryKey, $Value=1) : CAS-based nested key upsert.
+[void] RemoveNestedHashTableKey($Key, $SecondaryKey) : CAS-based nested key removal.
+[object] Get($Key)              : Get value by key.
+[object] GetAllKeys()           : Get all active keys.
+[object] GetAllValues()         : Get all active values.
+[bool] ContainsKey($Key)        : Check key existence.
+[hashtable] Clone()             : Deep copy of MergedHT.
+[void] CompactDatabase()        : Merge deltas into MainHT, reset queues.
+[void] SaveToDisk()             : Sync save to JSON.
+[void] SaveToDiskAsync()        : Async save (runspace).
+[void] WaitForAsyncSaveToDisk() : Block until async save completes.
+[bool] LoadFromDisk()           : Sync load. Returns $true if new data loaded.
+[void] LoadFromDiskAsync()      : Async load (background).
+[void] WaitForAsyncLoadFromDisk(): Block until async load completes.
+[void] EnsureDBFolderWithPermissions($SID, $AllowWrite=$false) : Create folder + set ACLs.
+[void] Dispose()                : Wait async, cleanup runspaces + memory.
 
 .EXAMPLE
-### 1. Initialization and Basic Usage
+# 1. Init & basic usage
 $db = [HashTableDB1]::new()
 $db.DatabaseFolderPath = "C:\Temp\MyDB"
 $db.DatabaseFileName = "AppData"
 $db.NumOfDbBackupsToKeep = 3
 $db.EnableTransactionLog = $true
-
-# Create folder if missing
 $db.EnsureDBFolderWithPermissions($null)
-
-# Load existing data (returns $true if loaded, $false if not found/no changes)
 $null = $db.LoadFromDisk()
-
-# Add / Update data
 $db.Add("User1", @{ Name = "Alice"; Role = "Admin" })
-$db.Add("User2", @{ Name = "Bob"; Role = "User" })
-
-# Add secondary keys safely
 $db.UpsertNestedHashTableKey("User1", "Permissions", "FullAccess")
-
-# Read data
 $user1 = $db.Get("User1")
-
-# Remove data
 $db.Remove("User2")
 
 .EXAMPLE
+# 2. Save & compact
 $db.SaveToDisk()
-# Force merge updates into main file to keep update file small
-$db.CompactDatabase()
+$db.CompactDatabase()  # Merge deltas
 $db.SaveToDisk()
 
 .EXAMPLE
-### 3. Asynchronous Save with Wait
+# 3. Async save
 $db.Add("User3", @{ Name = "Charlie" })
-$db.SaveToDiskAsync() # Non-blocking save
-# Do other work here...
-# Wait for background save to finish before exiting or disposing
+$db.SaveToDiskAsync()
+# Do other work...
 $db.WaitForAsyncSaveToDisk()
-
-# Cleanup
 $db.Dispose()
 
 .EXAMPLE
-### 4. Using Database Parameters
+# 4. DB parameters
 $db.DatabaseParamsHT["Version"] = "1.0.0"
 $db.DatabaseParamsHT["LastModifiedBy"] = $env:USERNAME
-$db.SaveToDisk() # Parameters are saved automatically inside the deletes file.
+$db.SaveToDisk()  # Params saved in deletes file.
 #>
+<#
+LLM Contract
+# legend: *=has shorter overloads, {a,b}=variant group, <x>=substituted token, ?=optional, =def=default, !=throws, @=metadata, #=phase, .main=top-level body, @export=exported
+# types: s=string i=int b=bool o=obj/psobject a=array a<T>=typed array d=datetime r=regex ss=SecureString u=uint ul=ulong dict=Dictionary
 
+@using: System.Text.Json (C# via Add-Type)
+PSObjectJsonConverter (C#, JsonConverter<object>): PS-native JSON converter
+P._xmlMinifyRegex(r,static): CLIXML minify regex
+P._typeKindCache(dict,static): type kind cache
+P._currentDepth(i,threadstatic): recursion depth tracker
+P._activeObjects(HashSet<object>): cycle detection set
+P._serializedNodes(ul): node budget counter
+P._sawClassMarker(b,threadstatic): '~C' marker seen flag
+M.GetTypeKind(o,static) -> i: classify dict/list kind
+M.ResetClassMarkerDetection(static): clear marker flag
+M.HasReadClassMarkers(static) -> b: check marker seen
+M.CollectClassNodes(a<o>,static) -> List<object[]>: find '~C' nodes DFS
+M.RehydrateClassNode(dict,Func,static) -> o: build class instance
+M.BuildHashtable(dict,static) -> hashtable: copy to case-insensitive hashtable
+M.BuildConcurrentDictionary(dict=source,s?=excludeKey,static) -> dict: build case-insensitive CD
+M.BuildMergedDictionary(dict,dict,dict,static) -> dict: merge main+updates-removed
+M.Read(Utf8JsonReader,Type,options) -> o: JSON to PS types
+M.Write(Utf8JsonWriter,o,options)!JsonException: PS object to JSON
+M.WriteInternal(Utf8JsonWriter,o,options): map types recursively
+
+Scriptblocks ($Script:):
+HashtableDB1Class_SaveScriptBlock(o=thisObj,o=mainSnap,o=updatesSnap,o=removedSnap): save 3 DB files atomic with backup rotation
+  M._MoveOld(s=folder,s=baseName,i=bakCount,s=TimeStamp): rotate backups
+  M._RetryFileOp(scriptblock,i=5,i=100): retry file operation
+HashtableDB1Class_LoadScriptBlock(o=thisObj): load 3 DB files with recovery
+HashtableDB1Class_SaveTxLogScriptBlock(o,o,o,s): persist delta txlog file
+HashtableDB1Class_TryRehydrateScriptBlock(o) -> o?: rehydrate '~C' node PS fallback
+HashtableDB1Class_RestoreClassesScriptBlock(o) -> o: iterative class restoration
+HashtableDB1Class_LoadAsyncScriptBlock(o,o): background load composite
+  #b: deserialize files
+  #p: build CDs publish state
+  #e: collect pending class nodes
+
+AsyncContainer: runspace pool holder
+P.Pool(RunspacePool): persistent pool
+P.PSInstance(PowerShell): current instance
+P.PsEventJob(PSEventJob): state-changed event job
+P.BeginInvokeResult(IAsyncResult): async result
+
+HashTableDB1: persistent hashtable database
+P.MainHT(dict): main records CD
+P.UpdatesHT(dict): pending changes CD
+P.MergedHT(dict): merged view CD
+P.RemovedHT(dict): removed keys tombstones CD
+P.{MainFileLoadedDT,UpdatesFileLoadedDT,RemovedFileLoadedDT}(d?): load/save timestamps
+P.DatabaseParamsHT(hashtable): stored DB params
+P.DatabaseFileName(s)="HashTableDB": base file name
+P.StorageFormat(s)='Json': Json or Xml mode
+P.DatabaseFolderPath(s)=".\": folder path
+P.{ErrorLevel,ErrorText}: error state
+P.{NumOfDbBackupsToKeep=0,CurrentBackupNumber=0}: backup control
+P.DatabaseReadAccessControlListIdentifiers(a?): read ACL SIDs
+P.ReadOnlyMode(b)=false: client readonly
+P.AsyncResults(hashtable,synchronized,hidden): async outcomes
+P.IsForceSaveMain(b)=false: force main rewrite
+P.EnableTransactionLog(b)=false: TxLog enabled
+P.TxLogRetentionDays(i)=3: TxLog retention
+P.KeyToTick(dict): key to last tick
+P.TickToKeysLock(o,hidden): lock object
+P.TickToKeys(SortedDictionary,hidden): tick to ops
+P.LastTransactionLogSavedTimestamp(ul)=0: last persisted tick
+P.LastTxLogTick(ul)=0: compat tick
+P.LockFileMaxWaitTime(i)=30: async wait timeout
+P.{AsynchronousSaveOperationState,AsynchronousTransactionLogSaveState,AsynchronousLoadOperationState}(AsyncContainer,hidden): async state
+P.BadEventJobStates(a): error job states
+M.CreateEmptyDB(): clear all state
+M.Add(s=s,o=HashValue): upsert record
+M.Remove(s=KeyName): tombstone record
+M.UpsertNestedHashTableKey(s,s,?=1)!Exception: CAS upsert nested key
+M.RemoveNestedHashTableKey(s,s)!Exception: CAS remove nested key
+M.Get(s) -> o?: fetch record
+M.GetAllKeys() -> o: list keys
+M.GetAllValues() -> o: list values
+M.ContainsKey(s) -> b: check key
+M.GetPendingChangesCount() -> i: count pending changes
+M.Clone() -> hashtable: copy merged view
+M.CompactDatabase(): merge updates into main
+M.SaveToDisk(): synchronous save files
+M.SaveToDiskAsync(): background save files
+M.WaitForAsyncSaveToDisk(): wait previous async save
+M.WaitForPendingTransactionLogOperations(): wait previous txlog op
+M.writeAsyncInstanceErrors(o,s='AsyncOp'): log instance errors
+M.SaveTransactionLogAsync(): background txlog save
+M.LoadFromDisk() -> b: load files sync
+M.WaitForAsyncLoadFromDisk(): wait previous async load
+M.LoadFromDiskAsync(): background load files
+M.EnsureDBFolderWithPermissions(s=SID,b?=false): set folder ACL
+M.Dispose(): release all resources
+M.CleanupAsync(ref,static): stop dispose async job
+
+.main: guard outdated PSObjectJsonConverter, Add-Type C# converter, verify static methods, define scriptblocks and HashTableDB1 class
+#>
 # Registering C# converter for System.Text.Json to handle PowerShell objects natively and fast
  $psConverterType = 'PSObjectJsonConverter' -as [type]
 if ($psConverterType -and -not $psConverterType.GetMethod('BuildConcurrentDictionary', [System.Reflection.BindingFlags]'Public, Static')) {
