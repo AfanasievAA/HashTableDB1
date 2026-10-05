@@ -3,12 +3,12 @@
 HashTableDB1 is a high-performance, thread-safe, persistent key-value database for PowerShell. It uses ConcurrentDictionary for in-memory operations and automatically persists to JSON files (with legacy XML fallback). It supports synchronous/asynchronous saving/loading, automatic consolidation, backup rotation, and transaction logging.
 
 .DESCRIPTION
-High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly—use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
+High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly-use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.28
+  Version:        1.29
   Author:         Andrew Afanasiev
-  Date:           29 Sep 2026
+  Date:           05 Oct 2026
   Contact:        AfanasievAA@yandex.ru
   WARNING: Do not apply AI-generated "optimizations" without thorough testing. This is a production-critical database engine. Incorrect changes can cause data loss.
   Before committing changes: run all 3 test scripts in the code_testing\ folder. All tests must pass with zero errors.
@@ -2155,6 +2155,10 @@ Class HashTableDB1 {
                     $msgData = $Event.MessageData
                     $localAsyncResult = $msgData.AsyncResult
                     $thisObj = $msgData.thisObj
+                    # Same terminal-state guard as the load action: EndInvoke() is blocking, so handling the
+                    # Running transition would freeze the main thread for the whole save duration.
+                    $invState = $event.SourceEventArgs.InvocationStateInfo.State
+                    if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                     try {
                         $null = $PSInstance.EndInvoke($localAsyncResult)
                     } catch {
@@ -2315,6 +2319,10 @@ Class HashTableDB1 {
                     $localPSInstance = $event.Sender
                     $iar    = $event.MessageData.AsyncResult
                     $thisObj = $event.MessageData.thisObject
+                    # Same terminal-state guard as the load action: EndInvoke() is blocking, so handling the
+                    # Running transition would freeze the main thread for the whole TxLog save duration.
+                    $invState = $event.SourceEventArgs.InvocationStateInfo.State
+                    if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                     try {
                         $null = $localPSInstance.EndInvoke($iar)
                     } catch {
@@ -2554,6 +2562,12 @@ Class HashTableDB1 {
                 $messageData = $event.MessageData
                 $thisObj = $messageData.thisObj
                 $asyncResult = $messageData.asyncResult
+                # InvocationStateChanged fires on EVERY state transition (NotStarted -> Running -> Completed/Failed).
+                # This action runs on the MAIN thread and EndInvoke() is a BLOCKING call: handling the Running
+                # transition froze the main thread for the entire background load duration, and the action then ran
+                # a second time on Completed (double post-processing). Handle terminal states only.
+                $invState = $event.SourceEventArgs.InvocationStateInfo.State
+                if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                 try {
                     # End the invocation properly. Guard against empty output array if scriptblock threw before return.
                     $loadResultArray = $PSInstance.EndInvoke($asyncResult)
@@ -2812,7 +2826,7 @@ Class HashTableDB1 {
         # PowerShell-instance: stop synchronously with bounded wait, then dispose
         if ($obj.Value.PSInstance) {
             try {
-                if (-not $obj.Value.PSInstance.InvocationStateInfo.State -in @([System.Management.Automation.PSInvocationState]::Stopped, [System.Management.Automation.PSInvocationState]::Failed)) {
+                if ($obj.Value.PSInstance.InvocationStateInfo.State -notin @([System.Management.Automation.PSInvocationState]::Stopped, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Completed)) {
                     $obj.Value.PSInstance.BeginStop($null, $null)
                     # Bounded wait to let PSInstance actually stop before Dispose
                     $stopWait = [datetime]::Now
