@@ -6,7 +6,7 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly-use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.29
+  Version:        1.30
   Author:         Andrew Afanasiev
   Date:           05 Oct 2026
   Contact:        AfanasievAA@yandex.ru
@@ -361,6 +361,147 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         }
         if (!mapped && !loaded) { return null; }
         return instance;
+    }
+
+    // Collects the distinct '~C' class names from pending frames in one native pass. The caller then resolves
+    // each UNIQUE name once on the main session thread (user classes are only resolvable there) - O(unique
+    // classes) instead of O(nodes): tens of thousands of nodes resolve in milliseconds.
+    public static string[] CollectUniqueClassNames(System.Collections.Generic.List<object[]> pending) {
+        var seen = new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
+        if (pending != null) {
+            foreach (var frame in pending) {
+                if (frame == null || frame.Length < 3) { continue; }
+                var node = frame[2] as System.Collections.IDictionary;
+                if (node == null) { continue; }
+                var name = node["~C"] as string;
+                if (name != null) { seen.Add(name); }
+            }
+        }
+        var result = new string[seen.Count];
+        seen.CopyTo(result);
+        return result;
+    }
+
+    // Rehydrates '~C' nodes collected by CollectClassNodes and patches them into the live dictionaries in a
+    // single native pass. Designed to run in a BACKGROUND runspace: the caller resolves the class TYPES once
+    // on the main session thread (user classes live only in that session's state) and passes them as a
+    // name->Type map; Type objects are process-wide, so instantiation works from any thread. Per-type
+    // reflection data (writable properties, LoadFromData) is cached for the whole batch, and values whose
+    // runtime type already matches the property type skip LanguagePrimitives conversion. The PS scriptblock
+    // fallback is only used when psFallback is non-null (main-thread callers); a background runspace must
+    // pass null because the fallback needs main-session type resolution. Returns the count of rehydrated nodes.
+    public static int RehydratePendingNodes(
+        System.Collections.Generic.List<object[]> pending,
+        System.Collections.Generic.IDictionary<string, Type> typeMap,
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> liveMain,
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> liveUpdates,
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> liveMerged,
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> liveRemoved,
+        System.Collections.IDictionary rawMain,
+        System.Collections.IDictionary rawUpdates,
+        System.Func<object, object> psFallback) {
+        if (pending == null || typeMap == null || typeMap.Count == 0) { return 0; }
+        int rehydratedCount = 0;
+        var propCache = new System.Collections.Generic.Dictionary<Type, PropertyInfo[]>();
+        var loadCache = new System.Collections.Generic.Dictionary<Type, MethodInfo>();
+        for (int i = pending.Count - 1; i >= 0; i--) { // reverse: children before parents (LIFO frames)
+            var frame = pending[i];
+            if (frame == null || frame.Length < 3) { continue; }
+            var node = frame[2] as System.Collections.IDictionary;
+            if (node == null) { continue; }
+            string className = node["~C"] as string;
+            if (className == null) { continue; }
+            Type targetType = null;
+            if (!typeMap.TryGetValue(className, out targetType) || targetType == null) { continue; }
+            PropertyInfo[] props = null;
+            if (!propCache.TryGetValue(targetType, out props)) {
+                var writable = new System.Collections.Generic.List<PropertyInfo>();
+                foreach (PropertyInfo p in targetType.GetProperties(BindingFlags.Public | BindingFlags.Instance)) {
+                    if (p.CanWrite) { writable.Add(p); }
+                }
+                props = writable.ToArray();
+                propCache[targetType] = props;
+            }
+            MethodInfo loadFromData = null;
+            if (!loadCache.TryGetValue(targetType, out loadFromData)) {
+                foreach (MethodInfo m in targetType.GetMethods(BindingFlags.Public | BindingFlags.Instance)) {
+                    if (string.Equals(m.Name, "LoadFromData", StringComparison.OrdinalIgnoreCase) && m.GetParameters().Length == 1) { loadFromData = m; break; }
+                }
+                loadCache[targetType] = loadFromData;
+            }
+            object instance = null;
+            try { instance = System.Activator.CreateInstance(targetType); } catch { instance = null; }
+            if (instance == null) {
+                if (psFallback != null) {
+                    try { instance = psFallback(node); } catch { instance = null; }
+                }
+                if (instance == null) { continue; }
+            }
+            bool mapped = false;
+            foreach (System.Collections.DictionaryEntry e in node) {
+                string k = e.Key as string;
+                if (k == null || k == "~C") { continue; }
+                PropertyInfo matched = null;
+                foreach (PropertyInfo p in props) {
+                    if (string.Equals(p.Name, k, StringComparison.OrdinalIgnoreCase)) { matched = p; break; }
+                }
+                if (matched == null) { continue; }
+                try {
+                    object raw = e.Value;
+                    object converted;
+                    if (raw != null && raw.GetType() == matched.PropertyType) { converted = raw; }
+                    else { converted = System.Management.Automation.LanguagePrimitives.ConvertTo(raw, matched.PropertyType); }
+                    if (converted != null || !matched.PropertyType.IsValueType) { matched.SetValue(instance, converted); }
+                    mapped = true;
+                } catch { }
+            }
+            bool loaded = false;
+            if (loadFromData != null) {
+                try {
+                    object ret = loadFromData.Invoke(instance, new object[] { node });
+                    if (ret is bool && (bool)ret) { loaded = true; }
+                } catch { }
+            }
+            if (!mapped && !loaded) { continue; }
+            rehydratedCount++;
+            object parent = frame[0];
+            if (parent == null) { continue; } // root class node: not replaceable after Phase 2 (same semantics as the old in-action loop)
+            object slot = frame[1];
+            string slotKey = slot as string;
+            if (slotKey == null) { slotKey = (slot == null) ? string.Empty : slot.ToString(); }
+            if (rawMain != null && System.Object.ReferenceEquals(parent, rawMain)) {
+                // Depth-1 main value: patch live MainHT; merged only when not overridden by updates/removals
+                if (liveMain != null) { liveMain[slotKey] = instance; }
+                bool overridden = (liveRemoved != null && liveRemoved.ContainsKey(slotKey)) || (rawUpdates != null && rawUpdates.Contains(slotKey));
+                if (!overridden && liveMerged != null) { liveMerged[slotKey] = instance; }
+            } else if (rawUpdates != null && System.Object.ReferenceEquals(parent, rawUpdates)) {
+                // Depth-1 updates value: patch live UpdatesHT and merged (unless tombstoned)
+                if (liveUpdates != null) { liveUpdates[slotKey] = instance; }
+                if (!(liveRemoved != null && liveRemoved.ContainsKey(slotKey)) && liveMerged != null) { liveMerged[slotKey] = instance; }
+            } else {
+                var dict = parent as System.Collections.IDictionary;
+                if (dict != null) {
+                    // Nested container (incl. DatabaseParamsHT - shared by reference with Phase 2): patch in place
+                    dict[slot] = instance;
+                } else {
+                    var arr = parent as System.Array;
+                    // System.Array has no [] indexer (CS0021) - SetValue is the non-generic write accessor.
+                    // Slot comes from CollectClassNodes which pushes int indices for zero-based rank-1
+                    // arrays (JSON deserialization produces object[]), matching the single-index overload.
+                    if (arr != null && slot is int) { arr.SetValue(instance, (int)slot); }
+                    else {
+                        // PSCustomObject parent: replicate PowerShell dynamic property assignment semantics
+                        try {
+                            PSObject psoParent = PSObject.AsPSObject(parent);
+                            var prop = psoParent.Properties[slotKey];
+                            if (prop != null && prop.IsSettable) { prop.Value = instance; }
+                            else { psoParent.Properties.Add(new PSNoteProperty(slotKey, instance)); }
+                        } catch { }
+                    }
+                }
+            }
+        }
+        return rehydratedCount;
     }
 
     // Fast C# replacement for the slow PowerShell copy loops in Clone() and the save snapshot:
@@ -772,7 +913,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
 }
 # Verify the loaded converter actually contains the static helpers the load path depends on.
 # Catches a file where the C# converter edits were not applied (methods missing after compilation).
-foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode') {
+foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode','CollectUniqueClassNames','RehydratePendingNodes') {
     if (-not [PSObjectJsonConverter].GetMethod($requiredConverterMethod, [System.Reflection.BindingFlags]'Public, Static')) {
         throw "PSObjectJsonConverter is missing static method '$requiredConverterMethod' - the C# converter edits were not applied to this file. Apply them, then restart the PowerShell session and run again."
     }
@@ -1693,6 +1834,40 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     return $loadResult
 } # End of LoadAsyncScriptBlock
 
+# Async class rehydration composite: the '~C' per-node loop runs in a background runspace on the pool.
+# The TYPE MAP is built by the load event action on the main session thread (user classes are only
+# resolvable there) and passed in as an argument; Type objects are process-wide, so the C# monolith can
+# instantiate them from this thread. The PS scriptblock fallback is intentionally NOT passed: it needs
+# main-session type resolution and would execute main-session state on this thread.
+ $Script:HashtableDB1Class_RehydrateAsyncScriptBlock = {
+    param(
+        [object] $thisObj,
+        [object] $loadResult,
+        [object] $typeMap
+    )
+    $converterType = 'PSObjectJsonConverter' -as [type]
+    if (-not $converterType) { return 0 }
+    # Raw top-level hashtables (Phase 1 output) identify depth-1 nodes; the live CDs are patched directly
+    # from this background thread - the same cross-runspace mutation pattern Phase 2 already uses.
+    # Stopwatch replaces the removed console diagnostics: duration is published as a SEPARATE
+    # AsyncResults key. Do not append to AsyncResults['Message'] from this thread - the load event
+    # action may still be writing Message concurrently on the main thread (last-writer-wins).
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $count = $converterType::RehydratePendingNodes(
+        $loadResult.PendingClassNodes,
+        $typeMap,
+        $thisObj.MainHT,
+        $thisObj.UpdatesHT,
+        $thisObj.MergedHT,
+        $thisObj.RemovedHT,
+        $loadResult.MainHT,
+        $loadResult.UpdatesHT,
+        $null)
+    $sw.Stop()
+    $thisObj.AsyncResults['RehydrateDurationMs'] = $sw.ElapsedMilliseconds
+    return $count
+} # End of RehydrateAsyncScriptBlock
+
 # Reference class used to store persistent runspacepools and their results
 class AsyncContainer {
     # Runspace pool (created on first use, reused across calls)
@@ -1763,6 +1938,8 @@ Class HashTableDB1 {
     hidden [AsyncContainer] $AsynchronousTransactionLogSaveState = [AsyncContainer]::new()
     # Async-load tracking and persisntent pool
     hidden [AsyncContainer] $AsynchronousLoadOperationState = [AsyncContainer]::new()
+    # Background '~C' class rehydration tracking and persistent pool
+    hidden [AsyncContainer] $AsynchronousRehydrateOperationState = [AsyncContainer]::new()
     # Constant. PSEventJob (System.Management.Automation.Job) bad states indicating an error
     [System.Management.Automation.JobState[]] $BadEventJobStates = @(
         [System.Management.Automation.JobState]::Failed,
@@ -2048,39 +2225,45 @@ Class HashTableDB1 {
             }
         }
     }
-    # Wait for previous async to finish
-    [void] WaitForAsyncSaveToDisk() {
-        # If async load still in progress - wait for it to finish.
-        if ($this.AsynchronousSaveOperationState.BeginInvokeResult -and -not $this.AsynchronousSaveOperationState.BeginInvokeResult.IsCompleted) {
+    # Shared wait/check core for all async operations. The four WaitFor* wrappers pass their state
+    # container, display name, warning-code prefix and error-source label; the bounded wait loop with
+    # progress dots, the timeout kill, the previous-job state check and the completed-reference cleanup
+    # live here ONCE instead of being copy-pasted four times.
+    hidden [void] WaitForAsyncOperationCore([AsyncContainer]$State, [string]$OpName, [string]$CodePrefix, [string]$ErrSource) {
+        if ($State.BeginInvokeResult -and -not $State.BeginInvokeResult.IsCompleted) {
             $maxWait = [System.TimeSpan]::FromSeconds($this.LockFileMaxWaitTime)
             $start   = [datetime]::Now
             $jobFinished = $false
-            Write-Host "$($this.DatabaseFileName) SaveToXMLAsync is still running. Waiting..." -NoNewline -ForegroundColor DarkGray
+            Write-Host "$($this.DatabaseFileName) $OpName is still running. Waiting..." -NoNewline -ForegroundColor DarkGray
             while (-not $jobFinished) {
-                $signaled = $this.AsynchronousSaveOperationState.BeginInvokeResult.AsyncWaitHandle.WaitOne(250)
+                $signaled = $State.BeginInvokeResult.AsyncWaitHandle.WaitOne(250)
                 if ($signaled) {
                     $jobFinished = $true
                 } else {
                     Write-Host "." -NoNewline -ForegroundColor DarkGray
                     if (([datetime]::Now - $start) -gt $maxWait) {
                         Write-Host ""
-                        Write-Warning "WFASTX1. Async operation has exceeded allowed time. Stopping background process."
+                        Write-Warning "$($CodePrefix)1. Async operation has exceeded allowed time. Stopping background process."
+                        # 1. Unregister the event so its Action won't try to wait for EndInvoke() and hang
+                        # 2. Asynchronously send a stop command (does not block the thread)
+                        # 3. Force-kill the RunspacePool - this destroys a zombie thread
                         try {
-                            if ($this.AsynchronousSaveOperationState.PSEventJob -and $this.AsynchronousSaveOperationState.PSEventJob.Name) {
-                                Unregister-Event -SourceIdentifier $this.AsynchronousSaveOperationState.PSEventJob.Name -ErrorAction SilentlyContinue
+                            if ($State.PSEventJob -and $State.PSEventJob.Name) {
+                                Unregister-Event -SourceIdentifier $State.PSEventJob.Name -ErrorAction SilentlyContinue
                             }
-                            if ($this.AsynchronousSaveOperationState.PSInstance) {
-                                $this.AsynchronousSaveOperationState.PSInstance.BeginStop($null, $null)
+                            if ($State.PSInstance) {
+                                $State.PSInstance.BeginStop($null, $null)
                             }
-                            if ($this.AsynchronousSaveOperationState.Pool -and -not $this.AsynchronousSaveOperationState.Pool.IsDisposed) {
-                                $this.AsynchronousSaveOperationState.Pool.Close()
-                                $this.AsynchronousSaveOperationState.Pool.Dispose()
+                            if ($State.Pool -and -not $State.Pool.IsDisposed) {
+                                $State.Pool.Close()
+                                $State.Pool.Dispose()
                             }
                         } catch {}
-                        $this.AsynchronousSaveOperationState.Pool = $null
-                        $this.AsynchronousSaveOperationState.PSInstance = $null
-                        $this.AsynchronousSaveOperationState.PsEventJob = $null
-                        $this.AsynchronousSaveOperationState.BeginInvokeResult = $null
+                        # 4. Null-out all references so the class recreates the Pool on the next run
+                        $State.Pool = $null
+                        $State.PSInstance = $null
+                        $State.PsEventJob = $null
+                        $State.BeginInvokeResult = $null
                         break
                     }
                 }
@@ -2089,28 +2272,39 @@ Class HashTableDB1 {
             # If stream ended successfully give PSEventJob to finish max 2 sec
             if ($jobFinished) {
                 $startEventWait = [datetime]::Now
-                while ($this.AsynchronousSaveOperationState.PSEventJob -and ($this.AsynchronousSaveOperationState.PSEventJob.State -eq [System.Management.Automation.JobState]::NotStarted -or $this.AsynchronousSaveOperationState.PSEventJob.State -eq [System.Management.Automation.JobState]::Running)) {
+                while ($State.PSEventJob -and ($State.PSEventJob.State -eq [System.Management.Automation.JobState]::NotStarted -or $State.PSEventJob.State -eq [System.Management.Automation.JobState]::Running)) {
                     if (([datetime]::Now - $startEventWait).TotalSeconds -gt 2) { break }
                     Start-Sleep -Milliseconds 50
                 }
             }
         }
-        # Checking previous job event
-        if ($this.AsynchronousSaveOperationState.PSEventJob -and $this.AsynchronousSaveOperationState.PSEventJob.State -in $this.BadEventJobStates) {
-            Write-Warning "WARNING! WFASTX2. Bad previous PSEventJob state = $($this.AsynchronousSaveOperationState.PSEventJob.State)."
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousSaveOperationState)
-        } elseif ($this.AsynchronousSaveOperationState.PSEventJob -and $this.AsynchronousSaveOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Stopped -and $this.AsynchronousSaveOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Completed) {
-            Write-Warning "WARNING! WFASTX3. Previous event job is not completed. Status $($this.AsynchronousSaveOperationState.PSEventJob.State)"
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousSaveOperationState)
-        } elseif ($this.AsynchronousSaveOperationState.PSInstance -and $this.AsynchronousSaveOperationState.PSInstance.HadErrors) {
-            Write-Warning "WARNING! WFASTX4.  Previous PSInstance had errors."
-            $this.writeAsyncInstanceErrors($this.AsynchronousSaveOperationState.PSInstance, 'AsyncSave')
+        $this.CheckPreviousEventJob($State, $CodePrefix, $ErrSource)
+        # FIXED Double Dispose: Avoid manual disposal here to prevent race conditions with Register-ObjectEvent Action.
+        if ($State.BeginInvokeResult -and $State.BeginInvokeResult.IsCompleted) {
+            $State.PSInstance = $null
+            $State.PsEventJob = $null
         }
-        # The Event Action calls CleanupAsync on completion. We only null the references if they are already completed.
-        if ($this.AsynchronousSaveOperationState.BeginInvokeResult -and $this.AsynchronousSaveOperationState.BeginInvokeResult.IsCompleted) {
-            $this.AsynchronousSaveOperationState.PSInstance = $null
-            $this.AsynchronousSaveOperationState.PsEventJob = $null
+    }
+    # Shared previous-job state check: used by the wait core and by the *Async launchers
+    # (the launcher re-checks after pool setup - the job may have completed meanwhile).
+    hidden [void] CheckPreviousEventJob([AsyncContainer]$State, [string]$CodePrefix, [string]$ErrSource) {
+        if ($State.PSEventJob -and $State.PSEventJob.State -in $this.BadEventJobStates) {
+            Write-Warning "WARNING! $($CodePrefix)2. Bad previous PSEventJob state = $($State.PSEventJob.State)."
+            [HashTableDB1]::CleanupAsync([ref]$State)
+        } elseif ($State.PSEventJob -and $State.PSEventJob.State -ne [System.Management.Automation.JobState]::Stopped -and $State.PSEventJob.State -ne [System.Management.Automation.JobState]::Completed) {
+            Write-Warning "WARNING! $($CodePrefix)3. Previous event job is not completed. Status $($State.PSEventJob.State)"
+            [HashTableDB1]::CleanupAsync([ref]$State)
+        } elseif ($State.PSInstance -and $State.PSInstance.HadErrors) {
+            Write-Warning "WARNING! $($CodePrefix)4. Previous PSInstance had errors."
+            $this.writeAsyncInstanceErrors($State.PSInstance, $ErrSource)
         }
+    }
+    # Wait for previous async to finish
+    [void] WaitForAsyncSaveToDisk() {
+        # A pending background rehydration must complete first: saving a snapshot mid-rehydrate would
+        # persist not-yet-rehydrated values as plain hashtables (losing their '~C' class markers)
+        $this.WaitForAsyncRehydrate()
+        $this.WaitForAsyncOperationCore($this.AsynchronousSaveOperationState, 'SaveToXMLAsync', 'WFASTX', 'AsyncSave')
     }
     # Asynchronously save database to XML files
     [void] SaveToDiskAsync() {
@@ -2185,72 +2379,7 @@ Class HashTableDB1 {
     }
     # Wait for previous async to finish
     [void] WaitForPendingTransactionLogOperations() {
-        # If async load still in progress - wait for it to finish.
-        if ($this.AsynchronousTransactionLogSaveState.BeginInvokeResult -and -not $this.AsynchronousTransactionLogSaveState.BeginInvokeResult.IsCompleted) {
-            $maxWait = [System.TimeSpan]::FromSeconds($this.LockFileMaxWaitTime)
-            $start   = [datetime]::Now
-            $jobFinished = $false
-            Write-Host "$($this.DatabaseFileName) SaveTransactionLogAsync is still running. Waiting..." -NoNewline -ForegroundColor DarkGray
-            while (-not $jobFinished) {
-                $signaled = $this.AsynchronousTransactionLogSaveState.BeginInvokeResult.AsyncWaitHandle.WaitOne(250)
-                if ($signaled) {
-                    $jobFinished = $true
-                } else {
-                    Write-Host "." -NoNewline -ForegroundColor DarkGray
-                    if (([datetime]::Now - $start) -gt $maxWait) {
-                        Write-Host ""
-                        Write-Warning "WFASTXTX1. Async operation has exceeded allowed time. Stopping background process."
-                        # 1. Unregister the event so its Action won't try to wait for EndInvoke() and hang
-                        if ($this.AsynchronousTransactionLogSaveState.PSEventJob -and $this.AsynchronousTransactionLogSaveState.PSEventJob.Name) {
-                            try { Unregister-Event -SourceIdentifier $this.AsynchronousTransactionLogSaveState.PSEventJob.Name -ErrorAction SilentlyContinue } catch {}
-                        }
-                        # 2. Asynchronously send a command to stop the PSInstance (does not block the thread)
-                        try {
-                            if ($this.AsynchronousTransactionLogSaveState.PSInstance) {
-                                $this.AsynchronousTransactionLogSaveState.PSInstance.BeginStop($null, $null)
-                            }
-                        } catch {}
-                        # 3. FORCE-fully kill the RunspacePool. This will destroy the zombie thread.
-                        try {
-                            if ($this.AsynchronousTransactionLogSaveState.Pool -and -not $this.AsynchronousTransactionLogSaveState.Pool.IsDisposed) {
-                                $this.AsynchronousTransactionLogSaveState.Pool.Close()
-                                $this.AsynchronousTransactionLogSaveState.Pool.Dispose()
-                            }
-                        } catch {}
-                        # 4. Null-out all references so the class will recreate the Pool on the next run
-                        $this.AsynchronousTransactionLogSaveState.Pool = $null
-                        $this.AsynchronousTransactionLogSaveState.PSInstance = $null
-                        $this.AsynchronousTransactionLogSaveState.PsEventJob = $null
-                        $this.AsynchronousTransactionLogSaveState.BeginInvokeResult = $null
-                        break
-                    }
-                }
-            }
-            Write-Host ""
-            if ($jobFinished) {
-                $startEventWait = [datetime]::Now
-                while ($this.AsynchronousTransactionLogSaveState.PSEventJob -and ($this.AsynchronousTransactionLogSaveState.PSEventJob.State -eq [System.Management.Automation.JobState]::NotStarted -or $this.AsynchronousTransactionLogSaveState.PSEventJob.State -eq [System.Management.Automation.JobState]::Running)) {
-                    if (([datetime]::Now - $startEventWait).TotalSeconds -gt 2) { break }
-                    Start-Sleep -Milliseconds 50
-                }
-            }
-        }
-        # Checking previous job event
-        if ($this.AsynchronousTransactionLogSaveState.PSEventJob -and $this.AsynchronousTransactionLogSaveState.PSEventJob.State -in $this.BadEventJobStates) {
-            Write-Warning "WARNING! WFASTXTX2. Bad previous PSEventJob state = $($this.AsynchronousTransactionLogSaveState.PSEventJob.State)."
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousTransactionLogSaveState)
-        } elseif ($this.AsynchronousTransactionLogSaveState.PSEventJob -and $this.AsynchronousTransactionLogSaveState.PSEventJob.State -ne [System.Management.Automation.JobState]::Stopped -and $this.AsynchronousTransactionLogSaveState.PSEventJob.State -ne [System.Management.Automation.JobState]::Completed) {
-            Write-Warning "WARNING! WFASTXTX3. Previous event job is not completed. Status $($this.AsynchronousTransactionLogSaveState.PSEventJob.State)"
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousTransactionLogSaveState)
-        } elseif ($this.AsynchronousTransactionLogSaveState.PSInstance -and $this.AsynchronousTransactionLogSaveState.PSInstance.HadErrors) {
-            Write-Warning "WARNING! WFASTXTX4.  Previous PSInstance had errors."
-            $this.writeAsyncInstanceErrors($this.AsynchronousTransactionLogSaveState.PSInstance, 'AsyncSaveTx')
-        }
-        # Avoid manual disposal here to prevent race conditions with Register-ObjectEvent Action.
-        if ($this.AsynchronousTransactionLogSaveState.BeginInvokeResult -and $this.AsynchronousTransactionLogSaveState.BeginInvokeResult.IsCompleted) {
-            $this.AsynchronousTransactionLogSaveState.PSInstance = $null
-            $this.AsynchronousTransactionLogSaveState.PsEventJob = $null
-        }
+        $this.WaitForAsyncOperationCore($this.AsynchronousTransactionLogSaveState, 'SaveTransactionLogAsync', 'WFASTXTX', 'AsyncSaveTx')
     }
     [void]  writeAsyncInstanceErrors($psInst, [string]$Source = 'AsyncOp') {
         $collected = @()
@@ -2450,66 +2579,13 @@ Class HashTableDB1 {
     }
     # Wait for previous async to finish
     [void] WaitForAsyncLoadFromDisk() {
-        # If async load still in progress - wait for it to finish.
-        if ($this.AsynchronousLoadOperationState.BeginInvokeResult -and -not $this.AsynchronousLoadOperationState.BeginInvokeResult.IsCompleted) {
-            $maxWait = [System.TimeSpan]::FromSeconds($this.LockFileMaxWaitTime)
-            $start   = [datetime]::Now
-            $jobFinished = $false
-            Write-Host "$($this.DatabaseFileName) AsyncLoadFromDisk is still running. Waiting..." -NoNewline -ForegroundColor DarkGray
-            while (-not $jobFinished) {
-                $signaled = $this.AsynchronousLoadOperationState.BeginInvokeResult.AsyncWaitHandle.WaitOne(250)
-                if ($signaled) {
-                    $jobFinished = $true
-                } else {
-                    Write-Host "." -NoNewline -ForegroundColor DarkGray
-                    if (([datetime]::Now - $start) -gt $maxWait) {
-                        Write-Host ""
-                        Write-Warning "WFALFX1. Async operation has exceeded allowed time. Stopping background process."
-                        try {
-                            if ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.Name) {
-                                Unregister-Event -SourceIdentifier $this.AsynchronousLoadOperationState.PSEventJob.Name -ErrorAction SilentlyContinue
-                            }
-                            if ($this.AsynchronousLoadOperationState.PSInstance) {
-                                $this.AsynchronousLoadOperationState.PSInstance.BeginStop($null, $null)
-                            }
-                            if ($this.AsynchronousLoadOperationState.Pool -and -not $this.AsynchronousLoadOperationState.Pool.IsDisposed) {
-                                $this.AsynchronousLoadOperationState.Pool.Close()
-                                $this.AsynchronousLoadOperationState.Pool.Dispose()
-                            }
-                        } catch {}
-                        $this.AsynchronousLoadOperationState.Pool = $null
-                        $this.AsynchronousLoadOperationState.PSInstance = $null
-                        $this.AsynchronousLoadOperationState.PsEventJob = $null
-                        $this.AsynchronousLoadOperationState.BeginInvokeResult = $null
-                        break
-                    }
-                }
-            }
-            Write-Host ""
-            if ($jobFinished) {
-                $startEventWait = [datetime]::Now
-                while ($this.AsynchronousLoadOperationState.PSEventJob -and ($this.AsynchronousLoadOperationState.PSEventJob.State -eq [System.Management.Automation.JobState]::NotStarted -or $this.AsynchronousLoadOperationState.PSEventJob.State -eq [System.Management.Automation.JobState]::Running)) {
-                    if (([datetime]::Now - $startEventWait).TotalSeconds -gt 2) { break }
-                    Start-Sleep -Milliseconds 50
-                }
-            }
-        }
-        # Checking previous job event
-        if ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.State -in $this.BadEventJobStates) {
-            Write-Warning "WARNING! WFALFX2. Bad previous PSEventJob state = $($this.AsynchronousLoadOperationState.PSEventJob.State)."
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousLoadOperationState)
-        } elseif ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Stopped -and $this.AsynchronousLoadOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Completed) {
-            Write-Warning "WARNING! WFALFX3. Previous event job is not completed. Status $($this.AsynchronousLoadOperationState.PSEventJob.State)"
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousLoadOperationState)
-        } elseif ($this.AsynchronousLoadOperationState.PSInstance -and $this.AsynchronousLoadOperationState.PSInstance.HadErrors) {
-            Write-Warning "WARNING! WFALFX4.  Previous PSInstance had errors."
-            $this.writeAsyncInstanceErrors($this.AsynchronousLoadOperationState.PSInstance, 'AsyncLoad')
-        }
-        # FIXED Double Dispose: Avoid manual disposal here to prevent race conditions with Register-ObjectEvent Action.
-        if ($this.AsynchronousLoadOperationState.BeginInvokeResult -and $this.AsynchronousLoadOperationState.BeginInvokeResult.IsCompleted) {
-            $this.AsynchronousLoadOperationState.PSInstance = $null
-            $this.AsynchronousLoadOperationState.PsEventJob = $null
-        }
+        # A pending background rehydration still patches the live dictionaries this load replaces - wait for it first
+        $this.WaitForAsyncRehydrate()
+        $this.WaitForAsyncOperationCore($this.AsynchronousLoadOperationState, 'AsyncLoadFromDisk', 'WFALFX', 'AsyncLoad')
+    }
+    # Wait for previous async rehydrate to finish
+    [void] WaitForAsyncRehydrate() {
+        $this.WaitForAsyncOperationCore($this.AsynchronousRehydrateOperationState, 'RehydrateAsync', 'WRHYD', 'AsyncRehydrate')
     }
     # Asynchronous load from XML files. Usually used for preloading large databases in background
     [void] LoadFromDiskAsync() {
@@ -2524,22 +2600,10 @@ Class HashTableDB1 {
             # Reusing the same pool every time
             $poolLoadFromDiskAsync = $this.AsynchronousLoadOperationState.Pool
         }
-        # Checking previous job event
-        if ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.State -in $this.BadEventJobStates) {
-            Write-Warning "WARNING! LFXMLASNC1. Bad previous PSEventJob state = $($this.AsynchronousLoadOperationState.PSEventJob.State)."
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousLoadOperationState)
-        } elseif ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Stopped -and $this.AsynchronousLoadOperationState.PSEventJob.State -ne [System.Management.Automation.JobState]::Completed) {
-            Write-Warning "WARNING! LFXMLASNC2. Previous event job is not completed for some reason. Current status $($this.AsynchronousLoadOperationState.PSEventJob.State)"
-            [HashTableDB1]::CleanupAsync([ref]$this.AsynchronousLoadOperationState)
-        } elseif ($this.AsynchronousLoadOperationState.PSInstance -and $this.AsynchronousLoadOperationState.PSInstance.HadErrors) {
-            Write-Warning "WARNING! LFXMLASNC3.  Previous PSInstance had errors."
-            $this.writeAsyncInstanceErrors($this.AsynchronousLoadOperationState.PSInstance)
-        }
-        # FIXED Double Dispose: Avoid manual disposal here to prevent race conditions with Register-ObjectEvent Action.
-        if ($this.AsynchronousLoadOperationState.BeginInvokeResult -and $this.AsynchronousLoadOperationState.BeginInvokeResult.IsCompleted) {
-            $this.AsynchronousLoadOperationState.PSInstance = $null
-            $this.AsynchronousLoadOperationState.PsEventJob = $null
-        }
+        # Checking previous job event after pool setup (the job may have completed meanwhile).
+        # The tail null-out was dropped: WaitForAsyncLoadFromDisk at method start already performed it.
+        # Note: unified numbering - the old LFXMLASNC1/2/3 became LFXMLASNC2/3/4.
+        $this.CheckPreviousEventJob($this.AsynchronousLoadOperationState, 'LFXMLASNC', 'AsyncLoad')
         try {
             $PSInstance = [PowerShell]::Create()
             $PSInstance.RunspacePool = $poolLoadFromDiskAsync
@@ -2551,11 +2615,6 @@ Class HashTableDB1 {
             $msgData = @{
                 thisObj = $this
                 asyncResult  = $asyncResult
-                # Pass the rehydrate scriptblock explicitly: Script: scope may be unavailable inside the event job
-                tryRehydrateScriptBlock = $Script:HashtableDB1Class_TryRehydrateScriptBlock
-                # Converter type name resolved at runtime inside the event action (class literal is
-                # unavailable there): RehydrateClassNode / CollectClassNodes fast path for '~C' nodes
-                converterTypeName = 'PSObjectJsonConverter'
             }
             $this.AsynchronousLoadOperationState.PSEventJob = Register-ObjectEvent -InputObject $PSInstance -EventName InvocationStateChanged -Action {
                 $PSInstance = $event.Sender
@@ -2581,54 +2640,33 @@ Class HashTableDB1 {
                     }
                     $loadResult = $loadResultArray[0]
                     if ($loadResult.Success -and $loadResult.DataIsLoaded) {
-                        # Process '~C' nodes collected by the background runspace (Phase 3) in reverse order
-                        # (children before parents) so nested instances are rehydrated before their containers
-                        # copy them out of raw hashtables. Covers MainHT, UpdatesHT and DatabaseParamsHT.
-                        # Depth-1 nodes need live-CD patches: the raw top-level hashtables are NOT the live
-                        # ConcurrentDictionaries (built in Phase 2 before rehydration ran).
-                        $restoreSB = $messageData.tryRehydrateScriptBlock
+                        # '~C' nodes: resolve class TYPES here, on the main session thread (user classes are
+                        # only resolvable in this context) - ONCE PER UNIQUE CLASS NAME, not once per node.
+                        # The per-node rehydration runs in a BACKGROUND runspace (RehydratePendingAsync):
+                        # executing the loop inside this action froze the main thread for the whole
+                        # rehydration phase (measured: 60269 nodes = 10.0 sec). Type objects are
+                        # process-wide, so the background op can instantiate them from its own thread.
                         $pendingNodes = $loadResult.PendingClassNodes
                         if ($pendingNodes -and $pendingNodes.Count -gt 0) {
-                            # C# rehydration first (fast path), PS scriptblock as fallback for exotic
-                            # constructors. The type resolver is a PS delegate because user classes
-                            # are only resolvable in this (main session) context.
                             $converterType = 'PSObjectJsonConverter' -as [type]
-                            # Same class-body workaround: BCL Func type literal, scriptblock converts at runtime
-                            $typeResolver = [Func[string,Type]] { param($className) $className -as [type] }
-                            $mainHTRaw = $loadResult.MainHT
-                            $updatesHTRaw = $loadResult.UpdatesHT
-                            for ($i = $pendingNodes.Count - 1; $i -ge 0; $i--) {
-                                $frame = $pendingNodes[$i]
-                                $node = $frame[2]
-                                $rehydrated = $converterType::RehydrateClassNode($node, $typeResolver)
-                                if ($null -eq $rehydrated -and $restoreSB) { $rehydrated = & $restoreSB $node }
-                                if ($null -eq $rehydrated -or $null -eq $frame[0]) { continue }
-                                $parent = $frame[0]
-                                $slot = $frame[1]
-                                $slotKey = [string]$slot
-                                if ([object]::ReferenceEquals($parent, $mainHTRaw)) {
-                                    # Top-level main value: patch MainHT; merged only when not overridden by updates/removals
-                                    $thisObj.MainHT[$slotKey] = $rehydrated
-                                    if (-not $thisObj.RemovedHT.ContainsKey($slotKey) -and -not ($updatesHTRaw -and $updatesHTRaw.ContainsKey($slotKey))) { $thisObj.MergedHT[$slotKey] = $rehydrated }
-                                } elseif ([object]::ReferenceEquals($parent, $updatesHTRaw)) {
-                                    # Top-level updates value: patch UpdatesHT and merged (unless tombstoned)
-                                    $thisObj.UpdatesHT[$slotKey] = $rehydrated
-                                    if (-not $thisObj.RemovedHT.ContainsKey($slotKey)) { $thisObj.MergedHT[$slotKey] = $rehydrated }
-                                } elseif ($parent -is [System.Collections.IDictionary]) {
-                                    # Nested container (incl. DatabaseParamsHT - shared by reference with Phase 2): patch in place
-                                    $parent[$slot] = $rehydrated
-                                } elseif ($parent -is [System.Array]) {
-                                    $parent[$slot] = $rehydrated
-                                } else {
-                                    try { $parent."$slot" = $rehydrated } catch { }
+                            $uniqueNames = $converterType::CollectUniqueClassNames($pendingNodes)
+                            if ($uniqueNames -and $uniqueNames.Count -gt 0) {
+                                $typeMap = [System.Collections.Generic.Dictionary[string,Type]]::new()
+                                foreach ($className in $uniqueNames) {
+                                    $resolvedType = $className -as [type]
+                                    if ($resolvedType) { $typeMap[$className] = $resolvedType }
+                                }
+                                if ($typeMap.Count -gt 0) {
+                                    $thisObj.RehydratePendingAsync($loadResult, $typeMap)
                                 }
                             }
                         }
                         # All ConcurrentDictionaries, timestamps, DatabaseParamsHT, MergedHT and TxLog state
-                        # were already built and published by the background runspace (Phase 2). Rehydrated
-                        # nested containers are shared by reference with the live CDs (patched in place above),
-                        # and depth-1 slots were patched directly - no rebuild is needed here. This keeps the
-                        # main-thread event action lightweight and removes the multi-second freeze on large datasets.
+                        # were already built and published by the background runspace (Phase 2). Rehydration
+                        # patches are applied by the background rehydrate op: depth-1 slots go straight into
+                        # the live CDs, nested containers are patched in place (shared by reference with
+                        # Phase 2). This keeps the main-thread event action lightweight - no multi-second
+                        # freeze on large datasets.
                         $thisObj.AsyncResults['Success'] = $true
                         $thisObj.AsyncResults['Message'] = "Database $($thisObj.DatabaseFileName) loaded Asynchronously in $( [math]::Round($loadResult.LoadTime,3)) sec."
                         $thisObj.ErrorLevel = 0
@@ -2674,6 +2712,64 @@ Class HashTableDB1 {
             if ($PSInstance) {
                 try { $PSInstance.Dispose() } catch {}
                 $this.AsynchronousLoadOperationState.PSInstance = $null
+            }
+        }
+    }
+    # Launches background '~C' class rehydration. Called by the load event action after it resolves the
+    # class type map on the main session thread. Reuses the (now free) load pool to avoid cold runspace
+    # creation; falls back to a dedicated pool when the load pool is unavailable.
+    hidden [void] RehydratePendingAsync([object]$loadResult, [object]$typeMap) {
+        if (-not $this.AsynchronousRehydrateOperationState.Pool -or $this.AsynchronousRehydrateOperationState.Pool.IsDisposed) {
+            if ($this.AsynchronousLoadOperationState.Pool -and -not $this.AsynchronousLoadOperationState.Pool.IsDisposed) {
+                # The load op has completed by now - its pool is free; share it (Dispose guards with IsDisposed)
+                $this.AsynchronousRehydrateOperationState.Pool = $this.AsynchronousLoadOperationState.Pool
+            } else {
+                $poolRehydrate = [runspacefactory]::CreateRunspacePool(1,1)
+                $poolRehydrate.Open()
+                $this.AsynchronousRehydrateOperationState.Pool = $poolRehydrate
+            }
+        }
+        try {
+            $this.AsynchronousRehydrateOperationState.PSInstance = [PowerShell]::Create()
+            $this.AsynchronousRehydrateOperationState.PSInstance.RunspacePool = $this.AsynchronousRehydrateOperationState.Pool
+            $null = $this.AsynchronousRehydrateOperationState.PSInstance.AddScript($Script:HashtableDB1Class_RehydrateAsyncScriptBlock).AddArgument($this).AddArgument($loadResult).AddArgument($typeMap)
+            $asyncResult = $this.AsynchronousRehydrateOperationState.PSInstance.BeginInvoke()
+            $this.AsynchronousRehydrateOperationState.BeginInvokeResult = $asyncResult
+            $msgData = @{
+                thisObj = $this
+                asyncResult = $asyncResult
+            }
+            $this.AsynchronousRehydrateOperationState.PSEventJob = Register-ObjectEvent -InputObject $this.AsynchronousRehydrateOperationState.PSInstance -EventName InvocationStateChanged -Action {
+                    $psInst = $event.Sender
+                    $thisObj = $event.MessageData.thisObj
+                    $iar = $event.MessageData.asyncResult
+                    # Terminal-state guard (same as the other ops): EndInvoke is blocking, so handling
+                    # the Running transition would freeze the main thread.
+                    $invState = $event.SourceEventArgs.InvocationStateInfo.State
+                    if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
+                    try {
+                        $out = $psInst.EndInvoke($iar)
+                        $rehydratedCount = if ($out -and $out.Count) { $out[0] } else { 0 }
+                        # Duration measured by the background scriptblock (Stopwatch) - replaces the removed console diagnostics
+                        $rehydrateMs = $thisObj.AsyncResults['RehydrateDurationMs']
+                        $thisObj.AsyncResults['Message'] = "$($thisObj.AsyncResults['Message']) Rehydrated $rehydratedCount class instances in background ($rehydrateMs ms)."
+                    } catch {
+                        $thisObj.ErrorLevel = "RHYD2"
+                        $thisObj.ErrorText  = $_.Exception.Message
+                        Write-Warning "Async rehydrate error: $($_.Exception.Message)"
+                    } finally {
+                        [HashTableDB1]::CleanupAsync([ref]$thisObj.AsynchronousRehydrateOperationState)
+                    }
+            } -MessageData $msgData
+        } catch {
+            $this.ErrorLevel = "RHYD1"
+            $this.ErrorText = "Failed to start async rehydrate: $($_.Exception.Message)"
+            # Warning instead of ErrorLevel-only: the load action overwrites ErrorLevel with 0 right
+            # after the launch, so the console warning is the surviving signal
+            Write-Warning "RHYD1. Failed to start async rehydrate: $($_.Exception.Message)"
+            if ($this.AsynchronousRehydrateOperationState.PSInstance) {
+                try { $this.AsynchronousRehydrateOperationState.PSInstance.Dispose() } catch {}
+                $this.AsynchronousRehydrateOperationState.PSInstance = $null
             }
         }
     }
@@ -2748,57 +2844,32 @@ Class HashTableDB1 {
     }
     # Disposes class object
     [void] Dispose() {
+        # Rehydrate first: a pending background rehydration still patches the dictionaries cleared below
+        $this.WaitForAsyncRehydrate()
         $this.WaitForAsyncSaveToDisk()
         $this.WaitForPendingTransactionLogOperations()
         $this.WaitForAsyncLoadFromDisk()
-        if ($this.AsynchronousSaveOperationState.PSEventJob -and $this.AsynchronousSaveOperationState.PSEventJob.Name) {
-            Unregister-Event -SourceIdentifier $this.AsynchronousSaveOperationState.PSEventJob.Name -ErrorAction SilentlyContinue
+        # Unified cleanup of all four async operation containers (identical per-container steps).
+        # Rehydrate may share the load pool: the second dispose is guarded by IsDisposed.
+        foreach ($opState in @($this.AsynchronousSaveOperationState, $this.AsynchronousTransactionLogSaveState, $this.AsynchronousLoadOperationState, $this.AsynchronousRehydrateOperationState)) {
+            if (-not $opState) { continue }
+            if ($opState.PSEventJob -and $opState.PSEventJob.Name) {
+                Unregister-Event -SourceIdentifier $opState.PSEventJob.Name -ErrorAction SilentlyContinue
+            }
+            if ($opState.PSInstance -is [System.IDisposable]) {
+                $opState.PSInstance.Dispose()
+            }
+            $opState.PSInstance = $null
+            if ($opState.PsEventJob -is [System.IDisposable]) {
+                $opState.PsEventJob.Dispose()
+            }
+            $opState.PsEventJob = $null
+            if ($opState.Pool -is [System.IDisposable] -and -Not $opState.Pool.IsDisposed) {
+                $opState.Pool.Close()
+                $opState.Pool.Dispose()
+            }
+            $opState.Pool = $null
         }
-        if ($this.AsynchronousSaveOperationState.PSInstance -is [System.IDisposable]) {
-            $this.AsynchronousSaveOperationState.PSInstance.Dispose()
-        }
-        $this.AsynchronousSaveOperationState.PSInstance = $null
-        if ($this.AsynchronousSaveOperationState.PsEventJob -is [System.IDisposable]) {
-            $this.AsynchronousSaveOperationState.PsEventJob.Dispose()
-        }
-        $this.AsynchronousSaveOperationState.PsEventJob = $null
-        if ($this.AsynchronousSaveOperationState.Pool -is [System.IDisposable] -and -Not $this.AsynchronousSaveOperationState.Pool.IsDisposed) {
-            $this.AsynchronousSaveOperationState.Pool.Close()
-            $this.AsynchronousSaveOperationState.Pool.Dispose()
-        }
-        $this.AsynchronousSaveOperationState.Pool = $null
-        if ($this.AsynchronousTransactionLogSaveState.PSEventJob -and $this.AsynchronousTransactionLogSaveState.PSEventJob.Name) {
-            Unregister-Event -SourceIdentifier $this.AsynchronousTransactionLogSaveState.PSEventJob.Name -ErrorAction SilentlyContinue
-        }
-        if ($this.AsynchronousTransactionLogSaveState.PSInstance -is [System.IDisposable]) {
-            $this.AsynchronousTransactionLogSaveState.PSInstance.Dispose()
-        }
-        $this.AsynchronousTransactionLogSaveState.PSInstance = $null
-        if ($this.AsynchronousTransactionLogSaveState.PsEventJob -is [System.IDisposable]) {
-            $this.AsynchronousTransactionLogSaveState.PsEventJob.Dispose()
-        }
-        $this.AsynchronousTransactionLogSaveState.PsEventJob = $null
-        if ($this.AsynchronousTransactionLogSaveState.Pool -is [System.IDisposable] -and -Not $this.AsynchronousTransactionLogSaveState.Pool.IsDisposed) {
-            $this.AsynchronousTransactionLogSaveState.Pool.Close()
-            $this.AsynchronousTransactionLogSaveState.Pool.Dispose()
-        }
-        $this.AsynchronousTransactionLogSaveState.Pool = $null
-        if ($this.AsynchronousLoadOperationState.PSEventJob -and $this.AsynchronousLoadOperationState.PSEventJob.Name) {
-            Unregister-Event -SourceIdentifier $this.AsynchronousLoadOperationState.PSEventJob.Name -ErrorAction SilentlyContinue
-        }
-        if ($this.AsynchronousLoadOperationState.PSInstance -is [System.IDisposable]) {
-            $this.AsynchronousLoadOperationState.PSInstance.Dispose()
-        }
-        $this.AsynchronousLoadOperationState.PSInstance = $null
-        if ($this.AsynchronousLoadOperationState.PsEventJob -is [System.IDisposable]) {
-            $this.AsynchronousLoadOperationState.PsEventJob.Dispose()
-        }
-        $this.AsynchronousLoadOperationState.PsEventJob = $null
-        if ($this.AsynchronousLoadOperationState.Pool -is [System.IDisposable] -and -Not $this.AsynchronousLoadOperationState.Pool.IsDisposed) {
-            $this.AsynchronousLoadOperationState.Pool.Close()
-            $this.AsynchronousLoadOperationState.Pool.Dispose()
-        }
-        $this.AsynchronousLoadOperationState.Pool = $null
         if ($null -ne $this.AsyncResults) {
             $null = $this.AsyncResults.Clear()
         }
