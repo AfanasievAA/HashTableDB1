@@ -6,7 +6,7 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly-use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.30
+  Version:        1.31
   Author:         Andrew Afanasiev
   Date:           05 Oct 2026
   Contact:        AfanasievAA@yandex.ru
@@ -1226,115 +1226,52 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             $DeletesFile2Load = [System.IO.FileInfo]::new($deletesXmlPath)
         }
 
-        # Recovery logic. If JSON is missing, validate backups before restoring. If .tmp is corrupted, it falls back to .old without overwriting the good .old with bad .tmp.
-        if ($null -eq $MainFile2Load) {
+        # Recovery logic. If JSON is missing, validate backups before restoring. If .tmp is corrupted,
+        # it falls back to .old without overwriting the good .old with bad .tmp. One helper replaces the
+        # three formerly copy-pasted per-file blocks; it reads $jsonOptions from the caller scope
+        # (dynamic scoping) instead of taking it as a parameter.
+        function _RestoreFromBackup {
+            param(
+                [string] $basePath,  # file-set base ("$($fullPath)_main" etc): probes <base>.tmp then <base>.old
+                [string] $label      # "Main"/"Updates"/"Deletes" for warning messages
+            )
             foreach ($ext in @('.tmp', '.old')) {
-                $backupFile = "$($fullPath)_main$ext"
-                if ([System.IO.File]::Exists($backupFile)) {
+                $backupFile = "$basePath$ext"
+                if (-not [System.IO.File]::Exists($backupFile)) { continue }
+                try {
+                    $testHT = $null
+                    # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
+                    $isXmlContent = $false
                     try {
-                        $testHT = $null
-                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
-                        $isXmlContent = $false
+                        $stream = [System.IO.File]::OpenRead($backupFile)
                         try {
-                            $stream = [System.IO.File]::OpenRead($backupFile)
-                            try {
-                                $testHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
-                            } finally {
-                                $stream.Dispose()
-                            }
-                        } catch {
-                            # Fallback to legacy XML deserialization if JSON fails
-                            $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
-                            $isXmlContent = $true
-                        }
-                        if ($testHT -is [System.Collections.IDictionary]) {
-                            Write-Warning "Main database missing. Restoring from $ext file."
-                            $restoreExt = 'json'
-                            if ($isXmlContent) { $restoreExt = 'xml' }
-                            $destPath = "$($fullPath)_main.$restoreExt"
-                            if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
-                            [System.IO.File]::Move($backupFile, $destPath)
-                            $MainFile2Load = [System.IO.FileInfo]::new($destPath)
-                            break
+                            $testHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
+                        } finally {
+                            $stream.Dispose()
                         }
                     } catch {
-                        Write-Warning "Failed to restore from $backupFile (corrupted). Trying next if available."
+                        # Fallback to legacy XML deserialization if JSON fails
+                        $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
+                        $isXmlContent = $true
                     }
+                    if ($testHT -is [System.Collections.IDictionary]) {
+                        Write-Warning "$label database missing. Restoring from $ext file."
+                        $restoreExt = 'json'
+                        if ($isXmlContent) { $restoreExt = 'xml' }
+                        $destPath = "$basePath.$restoreExt"
+                        if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
+                        [System.IO.File]::Move($backupFile, $destPath)
+                        return [System.IO.FileInfo]::new($destPath)
+                    }
+                } catch {
+                    Write-Warning "Failed to restore from $backupFile (corrupted). Trying next if available."
                 }
             }
+            return $null
         }
-        if ($null -eq $UpdatesFile2Load) {
-            foreach ($ext in @('.tmp', '.old')) {
-                $backupFile = "$($fullPath)_updates$ext"
-                if ([System.IO.File]::Exists($backupFile)) {
-                    try {
-                        $testHT = $null
-                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
-                        $isXmlContent = $false
-                        try {
-                            $stream = [System.IO.File]::OpenRead($backupFile)
-                            try {
-                                $testHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
-                            } finally {
-                                $stream.Dispose()
-                            }
-                        } catch {
-                            # Fallback to legacy XML deserialization if JSON fails
-                            $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
-                            $isXmlContent = $true
-                        }
-                        if ($testHT -is [System.Collections.IDictionary]) {
-                            Write-Warning "Updates database missing. Restoring from $ext file."
-                            $restoreExt = 'json'
-                            if ($isXmlContent) { $restoreExt = 'xml' }
-                            $destPath = "$($fullPath)_updates.$restoreExt"
-                            if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
-                            [System.IO.File]::Move($backupFile, $destPath)
-                            $UpdatesFile2Load = [System.IO.FileInfo]::new($destPath)
-                            break
-                        }
-                    } catch {
-                        Write-Warning "Failed to restore from $backupFile (corrupted). Trying next if available."
-                    }
-                }
-            }
-        }
-        if ($null -eq $DeletesFile2Load) {
-            foreach ($ext in @('.tmp', '.old')) {
-                $backupFile = "$($fullPath)_deletes$ext"
-                if ([System.IO.File]::Exists($backupFile)) {
-                    try {
-                        $testHT = $null
-                        # Restore under the extension matching the content: CLIXML ('<') vs JSON ('{')
-                        $isXmlContent = $false
-                        try {
-                            $stream = [System.IO.File]::OpenRead($backupFile)
-                            try {
-                                $testHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
-                            } finally {
-                                $stream.Dispose()
-                            }
-                        } catch {
-                            # Fallback to legacy XML deserialization if JSON fails
-                            $testHT = [System.Management.Automation.PSSerializer]::Deserialize([System.IO.File]::ReadAllText($backupFile))
-                            $isXmlContent = $true
-                        }
-                        if ($testHT -is [System.Collections.IDictionary]) {
-                            Write-Warning "Deletes database missing. Restoring from $ext file."
-                            $restoreExt = 'json'
-                            if ($isXmlContent) { $restoreExt = 'xml' }
-                            $destPath = "$($fullPath)_deletes.$restoreExt"
-                            if ([System.IO.File]::Exists($destPath)) { [System.IO.File]::Delete($destPath) }
-                            [System.IO.File]::Move($backupFile, $destPath)
-                            $DeletesFile2Load = [System.IO.FileInfo]::new($destPath)
-                            break
-                        }
-                    } catch {
-                        Write-Warning "Failed to restore from $backupFile (corrupted). Trying next if available."
-                    }
-                }
-            }
-        }
+        if ($null -eq $MainFile2Load) { $MainFile2Load = _RestoreFromBackup -basePath "$($fullPath)_main" -label 'Main' }
+        if ($null -eq $UpdatesFile2Load) { $UpdatesFile2Load = _RestoreFromBackup -basePath "$($fullPath)_updates" -label 'Updates' }
+        if ($null -eq $DeletesFile2Load) { $DeletesFile2Load = _RestoreFromBackup -basePath "$($fullPath)_deletes" -label 'Deletes' }
         # End of recovery logic
 
         # Format of the loaded main file ('Json'/'Xml'); drives cross-format migration after load
@@ -1370,18 +1307,25 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $shouldLoadMain = ($null -eq $thisObj.MainFileLoadedDT) -or ($MainFile2Load.LastWriteTime -gt $thisObj.MainFileLoadedDT)
         $shouldLoadUpdates = ($null -eq $thisObj.UpdatesFileLoadedDT) -or ($UpdatesFile2Load -and $UpdatesFile2Load.LastWriteTime -gt $thisObj.UpdatesFileLoadedDT)
         $shouldLoadDeletes = ($null -eq $thisObj.RemovedFileLoadedDT) -or ($DeletesFile2Load -and $DeletesFile2Load.LastWriteTime -gt $thisObj.RemovedFileLoadedDT)
-        # Loading main file if it is newer or never loaded
-        if ($shouldLoadMain) {
-            $loadSuccess = $false
-            $fallbackFiles = @($MainFile2Load.FullName, "$($fullPath)_main.old")
-            foreach ($tryFile in $fallbackFiles) {
+        # Shared loader for one file set: primary file, then .old fallback. Returns a package
+        # @{ Data = <IDictionary|$null>; Error = <last exception message|$null> }. Collapses the three
+        # formerly copy-pasted blocks (LFX2/LFX4/LFX6 paths); reads $jsonOptions from the caller scope.
+        function _LoadDatabaseFile {
+            param(
+                [System.IO.FileInfo] $File2Load,  # primary file (.json preferred, legacy .xml supported)
+                [string] $oldPath,               # .old fallback candidate
+                [string] $label                  # "Main"/"Updates"/"Deletes" for warning messages
+            )
+            $lastError = $null
+            foreach ($tryFile in @($File2Load.FullName, $oldPath)) {
                 if (-not [System.IO.File]::Exists($tryFile)) { continue }
                 try {
+                    $loaded = $null
                     if ($tryFile.EndsWith(".json")) {
                         # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
                         $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
                         try {
-                            $resultData.MainHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
+                            $loaded = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
                         } finally {
                             $stream.Dispose()
                         }
@@ -1391,128 +1335,71 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                         # fed to PSSerializer and the fallback would always fail.
                         $rawContent = [System.IO.File]::ReadAllText($tryFile)
                         if ($rawContent.TrimStart().StartsWith('<')) {
-                            $resultData.MainHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
+                            $loaded = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
                         } else {
-                            $resultData.MainHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
+                            $loaded = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
                         }
                     }
-                    if (-Not ($resultData.MainHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
-                    $loadSuccess = $true
-                    if ($tryFile -ne $MainFile2Load.FullName) {
-                        Write-Warning "Main database corrupted. Restored from .old"
-                        [System.IO.File]::Copy($tryFile, $MainFile2Load.FullName, $true)
+                    if (-Not ($loaded -is [System.Collections.IDictionary])) { throw "Invalid type" }
+                    if ($tryFile -ne $File2Load.FullName) {
+                        Write-Warning "$label database corrupted. Restored from .old"
+                        [System.IO.File]::Copy($tryFile, $File2Load.FullName, $true)
                     }
-                    break
+                    return @{ Data = $loaded; Error = $null }
                 } catch {
-                    $resultData.MainHT = $null
-                    $resultData.ErrorText = $_.Exception.Message
+                    $lastError = $_.Exception.Message
                 }
             }
-            if (-not $loadSuccess) {
+            return @{ Data = $null; Error = $lastError }
+        }
+        # Loading main file if it is newer or never loaded
+        if ($shouldLoadMain) {
+            $pack = _LoadDatabaseFile -File2Load $MainFile2Load -oldPath "$($fullPath)_main.old" -label 'Main'
+            if ($null -ne $pack.Data) {
+                $resultData.MainHT = $pack.Data
+                $dataIsLoaded = $true
+                $resultData.MainFileLoadedDT = $MainFile2Load.LastWriteTime
+            } else {
                 $resultData.Success = $false
                 $resultData.ErrorLevel = "LFX2"
-                $resultData.ErrorText = "Main database corrupted and no valid fallback found. Last error: $($resultData.ErrorText)"
+                $resultData.ErrorText = "Main database corrupted and no valid fallback found. Last error: $($pack.Error)"
                 $resultData.DataIsLoaded = $false
                 return $resultData
             }
-            $dataIsLoaded = $true
-            $resultData.MainFileLoadedDT = $MainFile2Load.LastWriteTime
         }
         # Loading updates file if it is newer or never loaded
         if ($UpdatesFile2Load -and $shouldLoadUpdates) {
-            $loadSuccess = $false
-            $fallbackFiles = @($UpdatesFile2Load.FullName, "$($fullPath)_updates.old")
-            foreach ($tryFile in $fallbackFiles) {
-                if (-not [System.IO.File]::Exists($tryFile)) { continue }
-                try {
-                    if ($tryFile.EndsWith(".json")) {
-                        # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
-                        $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
-                        try {
-                            $resultData.UpdatesHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
-                        } finally {
-                            $stream.Dispose()
-                        }
-                    } else {
-                        # .old content sniffing: CLIXML starts with '<', JSON with '{' (see the main-file block)
-                        $rawContent = [System.IO.File]::ReadAllText($tryFile)
-                        if ($rawContent.TrimStart().StartsWith('<')) {
-                            $resultData.UpdatesHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
-                        } else {
-                            $resultData.UpdatesHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
-                        }
-                    }
-                    if (-Not ($resultData.UpdatesHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
-                    $loadSuccess = $true
-                    if ($tryFile -ne $UpdatesFile2Load.FullName) {
-                        Write-Warning "Updates database corrupted. Restored from .old"
-                        [System.IO.File]::Copy($tryFile, $UpdatesFile2Load.FullName, $true)
-                    }
-                    break
-                } catch {
-                    $resultData.UpdatesHT = $null
-                    $resultData.ErrorText = $_.Exception.Message
-                }
-            }
-            if (-not $loadSuccess) {
+            $pack = _LoadDatabaseFile -File2Load $UpdatesFile2Load -oldPath "$($fullPath)_updates.old" -label 'Updates'
+            if ($null -ne $pack.Data) {
+                $resultData.UpdatesHT = $pack.Data
+                $dataIsLoaded = $true
+                $resultData.UpdatesFileLoadedDT = $UpdatesFile2Load.LastWriteTime
+            } else {
                 $resultData.Success = $false
                 $resultData.ErrorLevel = "LFX4"
-                $resultData.ErrorText = "Updates database corrupted and no valid fallback found. Last error: $($resultData.ErrorText)"
+                $resultData.ErrorText = "Updates database corrupted and no valid fallback found. Last error: $($pack.Error)"
                 $resultData.DataIsLoaded = $false
                 return $resultData
             }
-            $dataIsLoaded = $true
-            $resultData.UpdatesFileLoadedDT = $UpdatesFile2Load.LastWriteTime
         }
         # Loading deletes file if it is newer or never loaded
         if ($DeletesFile2Load -and $shouldLoadDeletes) {
-            $loadSuccess = $false
-            $fallbackFiles = @($DeletesFile2Load.FullName, "$($fullPath)_deletes.old")
-            foreach ($tryFile in $fallbackFiles) {
-                if (-not [System.IO.File]::Exists($tryFile)) { continue }
-                try {
-                    if ($tryFile.EndsWith(".json")) {
-                        # 1MB read buffer: large files otherwise pay thousands of small-read syscalls
-                        $stream = [System.IO.FileStream]::new($tryFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 1048576)
-                        try {
-                            $resultData.RemovedHT = [System.Text.Json.JsonSerializer]::Deserialize($stream, [object], $jsonOptions)
-                        } finally {
-                            $stream.Dispose()
-                        }
-                    } else {
-                        # .old content sniffing: CLIXML starts with '<', JSON with '{' (see the main-file block)
-                        $rawContent = [System.IO.File]::ReadAllText($tryFile)
-                        if ($rawContent.TrimStart().StartsWith('<')) {
-                            $resultData.RemovedHT = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
-                        } else {
-                            $resultData.RemovedHT = [System.Text.Json.JsonSerializer]::Deserialize([string]$rawContent, [object], $jsonOptions)
-                        }
-                    }
-                    if (-Not ($resultData.RemovedHT -is [System.Collections.IDictionary])) { throw "Invalid type" }
-                    $loadSuccess = $true
-                    if ($tryFile -ne $DeletesFile2Load.FullName) {
-                        Write-Warning "Deletes database corrupted. Restored from .old"
-                        [System.IO.File]::Copy($tryFile, $DeletesFile2Load.FullName, $true)
-                    }
-                    break
-                } catch {
-                    $resultData.RemovedHT = $null
-                    $resultData.ErrorText = $_.Exception.Message
+            $pack = _LoadDatabaseFile -File2Load $DeletesFile2Load -oldPath "$($fullPath)_deletes.old" -label 'Deletes'
+            if ($null -ne $pack.Data) {
+                $resultData.RemovedHT = $pack.Data
+                $dataIsLoaded = $true
+                $resultData.RemovedFileLoadedDT = $DeletesFile2Load.LastWriteTime
+                # Restoring database params from special key
+                $resultData.DatabaseParamsHT = $resultData.RemovedHT["___DATABASEPARAMS___"]
+                if (-Not ($resultData.DatabaseParamsHT -is [System.Collections.IDictionary])) {
+                    $resultData.DatabaseParamsHT = @{}
                 }
-            }
-            if (-not $loadSuccess) {
+            } else {
                 $resultData.Success = $false
                 $resultData.ErrorLevel = "LFX6"
-                $resultData.ErrorText = "Deletes database corrupted and no valid fallback found. Last error: $($resultData.ErrorText)"
+                $resultData.ErrorText = "Deletes database corrupted and no valid fallback found. Last error: $($pack.Error)"
                 $resultData.DataIsLoaded = $false
                 return $resultData
-            }
-            $dataIsLoaded = $true
-            $resultData.RemovedFileLoadedDT = $DeletesFile2Load.LastWriteTime
-            # Restoring database params from special key
-            $resultData.DatabaseParamsHT = $resultData.RemovedHT["___DATABASEPARAMS___"]
-            if (-Not ($resultData.DatabaseParamsHT -is [System.Collections.IDictionary])) {
-                $resultData.DatabaseParamsHT = @{}
             }
         }
         $resultData.DataIsLoaded = $dataIsLoaded
@@ -1960,6 +1847,27 @@ Class HashTableDB1 {
         $this.RemovedFileLoadedDT = $null
         $this.DatabaseParamsHT = @{}
     }
+    # Registers a single key operation in the in-memory TxLog structures (KeyToTick + TickToKeys under
+    # Monitor). Shared by Add / Remove / UpsertNestedHashTableKey / RemoveNestedHashTableKey - previously
+    # four copy-pasted blocks. The EnableTransactionLog guard stays at each call site: moving it inside
+    # would add a method call to every hot-path write even when TxLog is disabled.
+    # Tuple instead of a PS object: direct .NET allocation, fast in tight loops.
+    hidden [void] RegisterTxOp([string]$keyName, [string]$op) {
+        $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
+        $this.KeyToTick[$keyName] = $nowTick
+        # Atomic insert-or-get to avoid lost list on race
+        $list = $null
+        [System.Threading.Monitor]::Enter($this.TickToKeysLock)
+        try {
+            if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
+                $list = [System.Collections.Generic.List[object]]::new()
+                $this.TickToKeys[$nowTick] = $list
+            }
+            $list.Add([System.Tuple]::Create($keyName, $op))
+        } finally {
+            [System.Threading.Monitor]::Exit($this.TickToKeysLock)
+        }
+    }
     # Adds record to a database
     [void] Add($KeyName, $HashValue) {
         $this.UpdatesHT[$KeyName] = $HashValue
@@ -1967,21 +1875,7 @@ Class HashTableDB1 {
         $null = $this.RemovedHT.TryRemove($KeyName, [ref]$null)
         # TxLog entries - store operation type "A"
         if ($this.EnableTransactionLog) {
-            $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
-            $this.KeyToTick[$KeyName] = $nowTick
-            # Atomic insert-or-get to avoid lost list on race
-            $list = $null
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
-                    $list = [System.Collections.Generic.List[object]]::new()
-                    $this.TickToKeys[$nowTick] = $list
-                }
-                # OPTIMIZATION: Use Tuple instead of PSCustomObject for massive speedup in tight loops
-                $list.Add([System.Tuple]::Create($KeyName, 'A'))
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
+            $this.RegisterTxOp($KeyName, 'A')
         }
     }
     # Removes record from a database
@@ -1991,19 +1885,7 @@ Class HashTableDB1 {
         $this.RemovedHT[$KeyName] = 1
         # TxLog entries - store operation type "R"
         if ($this.EnableTransactionLog) {
-            $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
-            $this.KeyToTick[$KeyName] = $nowTick
-            $list = $null
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
-                    $list = [System.Collections.Generic.List[object]]::new()
-                    $this.TickToKeys[$nowTick] = $list
-                }
-                $list.Add([System.Tuple]::Create($KeyName, 'R'))
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
+            $this.RegisterTxOp($KeyName, 'R')
         }
     }
     # Adds secondary key to hashtable database
@@ -2048,20 +1930,7 @@ Class HashTableDB1 {
         }
         # TxLog entry if enabled
         if ($this.EnableTransactionLog) {
-            $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
-            $this.KeyToTick[$KeyName] = $nowTick
-            $list = $null
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
-                    $list = [System.Collections.Generic.List[object]]::new()
-                    $this.TickToKeys[$nowTick] = $list
-                }
-                # OPTIMIZATION: Use Tuple instead of PSCustomObject
-                $list.Add([System.Tuple]::Create($KeyName, 'A'))
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
+            $this.RegisterTxOp($KeyName, 'A')
         }
     }
     # Removes secondary key from hashtable database
@@ -2098,20 +1967,7 @@ Class HashTableDB1 {
         }
         # TxLog entry if enabled
         if ($this.EnableTransactionLog) {
-            $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
-            $this.KeyToTick[$KeyName] = $nowTick
-            $list = $null
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
-                    $list = [System.Collections.Generic.List[object]]::new()
-                    $this.TickToKeys[$nowTick] = $list
-                }
-                # OPTIMIZATION: Use Tuple instead of PSCustomObject
-                $list.Add([System.Tuple]::Create($KeyName, 'A'))
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
+            $this.RegisterTxOp($KeyName, 'A')
         }
     }
     # Gets record from database. TryGetValue instead of the raw indexer: the indexer throws
