@@ -6,9 +6,9 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly-use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.31
+  Version:        1.32
   Author:         Andrew Afanasiev
-  Date:           05 Oct 2026
+  Date:           12 Oct 2026
   Contact:        AfanasievAA@yandex.ru
   WARNING: Do not apply AI-generated "optimizations" without thorough testing. This is a production-critical database engine. Incorrect changes can cause data loss.
   Before committing changes: run all 3 test scripts in the code_testing\ folder. All tests must pass with zero errors.
@@ -18,8 +18,10 @@ High-performance, thread-safe, persistent key-value store for PowerShell. Uses C
 DatabaseFolderPath [string]     : Database directory. Default: ".\"
 DatabaseFileName [string]       : Base filename (without extension). Default: "HashTableDB"
 NumOfDbBackupsToKeep [int]      : Backup count in OLD\. 0 = disabled.
-EnableTransactionLog [bool]     : Enable TxLog for incremental sync.
+EnableTransactionLog [bool]     : Enable TxLog for crash recovery / incremental sync.
 TxLogRetentionDays [int]        : TxLog retention (days). Default: 3.
+DbStateAsOfTick [long]          : Watermark: ops with tick <= value are persisted in DB files. Used by replay/sync.
+TxLogFlushToDisk [bool]         : Force txlog to physical disk before rename. Default: $false.
 DatabaseParamsHT [hashtable]    : User metadata (persisted in deletes file).
 ReadOnlyMode [bool]             : Block write operations.
 ErrorLevel [string/int]         : 0 = success, code = failure.
@@ -112,7 +114,7 @@ HashtableDB1Class_SaveScriptBlock(o=thisObj,o=mainSnap,o=updatesSnap,o=removedSn
   M._MoveOld(s=folder,s=baseName,i=bakCount,s=TimeStamp): rotate backups
   M._RetryFileOp(scriptblock,i=5,i=100): retry file operation
 HashtableDB1Class_LoadScriptBlock(o=thisObj): load 3 DB files with recovery
-HashtableDB1Class_SaveTxLogScriptBlock(o,o,o,s): persist delta txlog file
+HashtableDB1Class_SaveTxLogScriptBlock(o=thisObj,s=txLogFolder): atomically persist pending delta (tmp+rename), advance cutoff, trim map, rotate old files
 HashtableDB1Class_TryRehydrateScriptBlock(o) -> o?: rehydrate '~C' node PS fallback
 HashtableDB1Class_RestoreClassesScriptBlock(o) -> o: iterative class restoration
 HashtableDB1Class_LoadAsyncScriptBlock(o,o): background load composite
@@ -144,11 +146,13 @@ P.AsyncResults(hashtable,synchronized,hidden): async outcomes
 P.IsForceSaveMain(b)=false: force main rewrite
 P.EnableTransactionLog(b)=false: TxLog enabled
 P.TxLogRetentionDays(i)=3: TxLog retention
-P.KeyToTick(dict): key to last tick
-P.TickToKeysLock(o,hidden): lock object
-P.TickToKeys(SortedDictionary,hidden): tick to ops
+P.KeyToTx(dict): key -> Tuple(tick,op,value) of last op, captured at op time (lock-free LWW per key)
+P.TxTickGenerator(o,hidden): TxTickGenerator instance - monotonic tick source (CAS-clamped wall clock)
+P.TxLogSaveLock(o,hidden): mutual exclusion for sync+async TxLog save scriptblock runs
 P.LastTransactionLogSavedTimestamp(ul)=0: last persisted tick
-P.LastTxLogTick(ul)=0: compat tick
+P.LastTxLogTick(ul)=0: last tick persisted to a txlog file
+P.DbStateAsOfTick(ul)=0: watermark - ops with tick<=value are in the DB files (___DBSTATEASTOFTICK___ in the deletes file; published on save, restored on load)
+P.TxLogFlushToDisk(b)=false: fsync txlog before rename (recovery-critical mode)
 P.LockFileMaxWaitTime(i)=30: async wait timeout
 P.{AsynchronousSaveOperationState,AsynchronousTransactionLogSaveState,AsynchronousLoadOperationState}(AsyncContainer,hidden): async state
 P.BadEventJobStates(a): error job states
@@ -293,20 +297,18 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                 if (arr != null) {
                     if (visited.Add(node)) {
                         for (int i = 0; i < arr.Length; i++) {
-                            if (arr.GetValue(i) != null) { stack.Push(new object[] { arr, i, arr.GetValue(i) }); }
+                            var item = arr.GetValue(i);
+                            if (item != null) { stack.Push(new object[] { arr, i, item }); }
                         }
                     }
                 } else {
-                    PSObject pso = node as PSObject;
-                    if (pso != null && !(node is System.Management.Automation.PSCustomObject)) { pso = null; }
                     // Only descend into PSCustomObject instances (deserialized class-ish shapes);
-                    // other PSObject wrappers unwrap to their BaseObject elsewhere
-                    if (pso == null && node is System.Management.Automation.PSCustomObject) {
-                        pso = (PSObject)node;
-                    }
-                    if (pso != null && visited.Add(node)) {
-                        foreach (var prop in pso.Properties) {
-                            if (prop.IsSettable && prop.Value != null) { stack.Push(new object[] { pso, prop.Name, prop.Value }); }
+                    // other PSObject wrappers unwrap to their BaseObject elsewhere. PSCustomObject-typed
+                    // references do not expose the PSObject member collections, so access them through
+                    // the PSObject-typed view (AsPSObject returns the instance itself for PSObject values)
+                    if (node is System.Management.Automation.PSCustomObject && visited.Add(node)) {
+                        foreach (var prop in PSObject.AsPSObject(node).Properties) {
+                            if (prop.IsSettable && prop.Value != null) { stack.Push(new object[] { node, prop.Name, prop.Value }); }
                         }
                     }
                 }
@@ -547,7 +549,6 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                 // Try parsing from smallest to largest numeric type to match PowerShell native type semantics (e.g. Int32 for 1)
                 if (reader.TryGetInt32(out int i)) return i;
                 if (reader.TryGetInt64(out long l)) return l;
-                if (reader.TryGetUInt32(out uint ui)) return ui;
                 if (reader.TryGetUInt64(out ulong ul)) return (decimal)ul;
                 if (reader.TryGetDecimal(out decimal dec)) return dec;
                 if (reader.TryGetDouble(out double d)) return d;
@@ -762,22 +763,35 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             writer.WriteEndObject();
         } else if (kind == 2) {
             writer.WriteStartObject();
-            // Snapshot entries and detect all-Int32 keys to emit the '~i' marker for exact key type restoration
-            var genEntries = new List<dynamic>();
-            bool hasGenEntries = false;
-            bool allGenIntKeys = true;
-            foreach (dynamic entry in (IEnumerable)value) {
-                genEntries.Add(entry);
-                hasGenEntries = true;
-                if (!((object)entry.Key is int)) { allGenIntKeys = false; }
-            }
-            if (hasGenEntries && allGenIntKeys) {
-                writer.WritePropertyName("~i");
-                writer.WriteBooleanValue(true);
-            }
-            foreach (dynamic entry in genEntries) {
-                writer.WritePropertyName(entry.Key == null ? "null" : entry.Key.ToString());
-                Write(writer, entry.Value, options);
+            // Fast path for string-keyed object-valued dictionaries: ConcurrentDictionary<string,object> is
+            // the primary in-memory type of HashTableDB1, and typed enumeration avoids DLR dynamic dispatch
+            // and KeyValuePair boxing on every entry. String keys can never be Int32, so the '~i' marker does
+            // not apply here. Snapshot semantics match the dynamic path below.
+            var strDict = value as System.Collections.Generic.IDictionary<string, object>;
+            if (strDict != null) {
+                var strEntries = new List<KeyValuePair<string, object>>(strDict);
+                foreach (var entry in strEntries) {
+                    writer.WritePropertyName(entry.Key ?? "null");
+                    Write(writer, entry.Value, options);
+                }
+            } else {
+                // Snapshot entries and detect all-Int32 keys to emit the '~i' marker for exact key type restoration
+                var genEntries = new List<dynamic>();
+                bool hasGenEntries = false;
+                bool allGenIntKeys = true;
+                foreach (dynamic entry in (IEnumerable)value) {
+                    genEntries.Add(entry);
+                    hasGenEntries = true;
+                    if (!((object)entry.Key is int)) { allGenIntKeys = false; }
+                }
+                if (hasGenEntries && allGenIntKeys) {
+                    writer.WritePropertyName("~i");
+                    writer.WriteBooleanValue(true);
+                }
+                foreach (dynamic entry in genEntries) {
+                    writer.WritePropertyName(entry.Key == null ? "null" : entry.Key.ToString());
+                    Write(writer, entry.Value, options);
+                }
             }
             writer.WriteEndObject();
         // Serialize lists based on their generic/non-generic nature
@@ -908,15 +922,92 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             }
         }
     }
+
+    // Collects pending transaction entries newer than cutoffTick in one lock-free pass over the
+    // per-key op map (HashTableDB1.KeyToTx). Values were captured at op-registration time, so the
+    // entries are exact replay records. Returns [0] = List<object[]> of (op, key, value, tick) arrays
+    // - the on-disk txlog format, [1] = firstTick, [2] = lastTick (both 0 when nothing is pending).
+    public static object[] CollectPendingTxEntries(
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> keyToTx,
+        long cutoffTick) {
+        var entries = new System.Collections.Generic.List<object[]>();
+        long first = long.MaxValue;
+        long last = long.MinValue;
+        if (keyToTx != null) {
+            foreach (var e in keyToTx) {
+                var rec = e.Value as System.Tuple<long, string, object>;
+                if (rec == null || rec.Item1 <= cutoffTick) { continue; }
+                entries.Add(new object[] { rec.Item2, e.Key, rec.Item3, rec.Item1 });
+                if (rec.Item1 < first) { first = rec.Item1; }
+                if (rec.Item1 > last) { last = rec.Item1; }
+            }
+        }
+        if (entries.Count == 0) { return new object[] { entries, (long)0, (long)0 }; }
+        return new object[] { entries, first, last };
+    }
+
+    // Drops entries with tick <= savedTick after a SUCCESSFUL txlog write. The ReferenceEquals guard
+    // keeps records that a concurrent RegisterTxOp has just overwritten with a newer tick. New ticks
+    // are issued strictly above the generator watermark, so a concurrently registered op can never
+    // carry tick <= savedTick.
+    public static int TrimSavedTxEntries(
+        System.Collections.Concurrent.ConcurrentDictionary<string, object> keyToTx,
+        long savedTick) {
+        int removed = 0;
+        if (keyToTx != null) {
+            foreach (var e in keyToTx) {
+                var rec = e.Value as System.Tuple<long, string, object>;
+                if (rec == null || rec.Item1 > savedTick) { continue; }
+                object current;
+                if (keyToTx.TryGetValue(e.Key, out current) && System.Object.ReferenceEquals(current, e.Value)) {
+                    object dummy;
+                    if (keyToTx.TryRemove(e.Key, out dummy)) { removed++; }
+                }
+            }
+        }
+        return removed;
+    }
+}
+
+/// <summary>
+/// Monotonic tick source for the transaction log. Wall-clock based (FILETIME) but clamped above
+/// every previously issued tick via CAS: backward wall-clock jumps (NTP, manual adjust) and
+/// concurrent callers can never produce a regressing or reused sequence position. Ticks feed txlog
+/// file ranges, the saved-state watermark and LWW conflict resolution for cross-DB sync.
+/// </summary>
+public class TxTickGenerator {
+    private long _last;
+    // Returns a strictly increasing tick (never equal to or below any previously returned tick)
+    public long Next() {
+        long now = System.DateTime.UtcNow.ToFileTimeUtc();
+        while (true) {
+            long observed = System.Threading.Interlocked.Read(ref _last);
+            long candidate = (now > observed) ? now : observed + 1;
+            if (System.Threading.Interlocked.CompareExchange(ref _last, candidate, observed) == observed) { return candidate; }
+        }
+    }
+    // Raises the watermark to at least minTick (e.g. the state watermark loaded from disk) without regression
+    public void Bootstrap(long minTick) {
+        while (true) {
+            long observed = System.Threading.Interlocked.Read(ref _last);
+            if (observed >= minTick) { return; }
+            if (System.Threading.Interlocked.CompareExchange(ref _last, minTick, observed) == observed) { return; }
+        }
+    }
+    // Current watermark: every tick issued so far is <= this value
+    public long Current { get { return System.Threading.Interlocked.Read(ref _last); } }
 }
 '@
 }
 # Verify the loaded converter actually contains the static helpers the load path depends on.
 # Catches a file where the C# converter edits were not applied (methods missing after compilation).
-foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode','CollectUniqueClassNames','RehydratePendingNodes') {
+foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode','CollectUniqueClassNames','RehydratePendingNodes','CollectPendingTxEntries','TrimSavedTxEntries') {
     if (-not [PSObjectJsonConverter].GetMethod($requiredConverterMethod, [System.Reflection.BindingFlags]'Public, Static')) {
         throw "PSObjectJsonConverter is missing static method '$requiredConverterMethod' - the C# converter edits were not applied to this file. Apply them, then restart the PowerShell session and run again."
     }
+}
+if (-not ('TxTickGenerator' -as [type])) {
+    throw "TxTickGenerator type is missing - the C# converter edits were not applied to this file. Apply them, then restart the PowerShell session and run again."
 }
 
 # Start of main scriptblock to save database. Used by class object later
@@ -995,6 +1086,11 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $startDateTime = [System.Datetime]::Now
         # DIAGNOSTICS: coarse stage marker, included in the error message when the save fails
         $saveStage = 'init'
+        # State watermark for replay/sync: read BEFORE any snapshot serialization. RegisterTxOp is
+        # called AFTER the state writes, so every op with tick <= this value is already reflected in
+        # UpdatesHT/MergedHT/RemovedHT and captured by the serializations below. Interlocked read -
+        # the save runs on a background runspace thread
+        $stateAsOfTick = $thisObj.TxTickGenerator.Current
         $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
         $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
         # Disable escaping of <, > and non-ASCII to reduce JSON size
@@ -1008,13 +1104,15 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         if ($thisObj.StorageFormat -notin @('Json','Xml')) { throw "Invalid StorageFormat '$($thisObj.StorageFormat)' - use 'Json' or 'Xml'." }
         $ext = 'json'
         if ($thisObj.StorageFormat -eq 'Xml') { $ext = 'xml' }
+        # Base path prefix computed once and reused by every database file name below
+        $dbBase = Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName
         $tmpMain = $null
         $tmpUpdates = $null
         $tmpDeletes = $null
         # New data is saved to *.tmp files. Main file saved only if modified
         if ($thisObj.IsForceSaveMain) {
             $saveStage = 'main-serialize'
-            $tmpMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext.tmp"
+            $tmpMain = "$($dbBase)_main.$ext.tmp"
             if ($ext -eq 'xml') {
                 # CLIXML compatibility mode. Explicit depth is required: the parameterless Serialize
                 # overload silently truncates nested objects at depth 2.
@@ -1032,7 +1130,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             }
         }
         $saveStage = 'updates-serialize'
-        $tmpUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext.tmp"
+        $tmpUpdates = "$($dbBase)_updates.$ext.tmp"
         if ($ext -eq 'xml') {
             # CLIXML compatibility mode (explicit depth - see the main-file block above)
             [System.IO.File]::WriteAllText($tmpUpdates, [System.Management.Automation.PSSerializer]::Serialize($updatesSnap, 100))
@@ -1050,8 +1148,10 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $removedForSave = [PSObjectJsonConverter]::BuildHashtable($removedSnap)
         # Database parameters travel inside the deletes snapshot (read back by the load path)
         $removedForSave["___DATABASEPARAMS___"] = $thisObj.DatabaseParamsHT
+        # State watermark travels next to them: replay/sync apply only txlog entries with a newer tick
+        $removedForSave["___DBSTATEASTOFTICK___"] = $stateAsOfTick
         $saveStage = 'deletes-serialize'
-        $tmpDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext.tmp"
+        $tmpDeletes = "$($dbBase)_deletes.$ext.tmp"
         if ($ext -eq 'xml') {
             # CLIXML compatibility mode (explicit depth - see the main-file block above)
             [System.IO.File]::WriteAllText($tmpDeletes, [System.Management.Automation.PSSerializer]::Serialize($removedForSave, 100))
@@ -1064,32 +1164,29 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             }
         }
         # Database files names (extension depends on StorageFormat)
-        $mainJson    = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext"
-        $updatesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext"
-        $deletesJson = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext"
+        $mainJson    = "$($dbBase)_main.$ext"
+        $updatesJson = "$($dbBase)_updates.$ext"
+        $deletesJson = "$($dbBase)_deletes.$ext"
         # Renaming current files to OLD if they are present.
         $saveStage = 'rename-swap'
         if ($thisObj.IsForceSaveMain -and [System.IO.File]::Exists($mainJson)) {
-            $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.old"
+            $dest = "$($dbBase)_main.old"
             _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($mainJson, $dest) }
         }
         if ([System.IO.File]::Exists($updatesJson)) {
-            $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.old"
+            $dest = "$($dbBase)_updates.old"
             _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($updatesJson, $dest) }
         }
         if ([System.IO.File]::Exists($deletesJson)) {
-            $dest = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.old"
+            $dest = "$($dbBase)_deletes.old"
             _RetryFileOp { if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Delete($dest) }; [System.IO.File]::Move($deletesJson, $dest) }
         }
         # Renaming tmp files to the final extension (actual version saved)
         if ($thisObj.IsForceSaveMain) {
-            $finalMain = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$ext"
-            _RetryFileOp { if ([System.IO.File]::Exists($finalMain)) { [System.IO.File]::Delete($finalMain) }; [System.IO.File]::Move($tmpMain, $finalMain) }
+            _RetryFileOp { if ([System.IO.File]::Exists($mainJson)) { [System.IO.File]::Delete($mainJson) }; [System.IO.File]::Move($tmpMain, $mainJson) }
         }
-        $finalUpdates = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$ext"
-        _RetryFileOp { if ([System.IO.File]::Exists($finalUpdates)) { [System.IO.File]::Delete($finalUpdates) }; [System.IO.File]::Move($tmpUpdates, $finalUpdates) }
-        $finalDeletes = "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$ext"
-        _RetryFileOp { if ([System.IO.File]::Exists($finalDeletes)) { [System.IO.File]::Delete($finalDeletes) }; [System.IO.File]::Move($tmpDeletes, $finalDeletes) }
+        _RetryFileOp { if ([System.IO.File]::Exists($updatesJson)) { [System.IO.File]::Delete($updatesJson) }; [System.IO.File]::Move($tmpUpdates, $updatesJson) }
+        _RetryFileOp { if ([System.IO.File]::Exists($deletesJson)) { [System.IO.File]::Delete($deletesJson) }; [System.IO.File]::Move($tmpDeletes, $deletesJson) }
         # Moving OLD files to OLD folder for backup
         $Timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
         if ($thisObj.NumOfDbBackupsToKeep -gt 0) {
@@ -1103,9 +1200,9 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         } else {
             # If not required to backup - deleting old files
             foreach($old in @(
-                "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.old",
-                "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.old",
-                "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.old")) {
+                "$($dbBase)_main.old",
+                "$($dbBase)_updates.old",
+                "$($dbBase)_deletes.old")) {
                 if ([System.IO.File]::Exists($old)) {
                     for ($i = 0; $i -lt 5; $i++) {
                         try { [System.IO.File]::Delete($old); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 100 }
@@ -1119,9 +1216,9 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
         $otherExt = 'xml'
         if ($ext -eq 'xml') { $otherExt = 'json' }
         $legacyFiles = @(
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_main.$otherExt",
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_updates.$otherExt",
-            "$(Join-Path $thisObj.DatabaseFolderPath $thisObj.DatabaseFileName)_deletes.$otherExt"
+            "$($dbBase)_main.$otherExt",
+            "$($dbBase)_updates.$otherExt",
+            "$($dbBase)_deletes.$otherExt"
         )
         $oldFolder = $null
         foreach ($legacyFile in $legacyFiles) {
@@ -1146,6 +1243,9 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             }
         }
         $endDateTime = [System.Datetime]::Now
+        # The persisted files now reflect every op with tick <= the watermark - publish it so
+        # callers can track the replay position without reloading
+        $thisObj.DbStateAsOfTick = $stateAsOfTick
         $thisObj.AsyncResults['Success'] = $true
         $thisObj.AsyncResults['Message'] = "Asynchronous save of database $($thisObj.DatabaseFileName) started $($startDateTime.ToString("yyyy.MM.dd HH:mm:ss")) completed in $([math]::Round((($endDateTime-$startDateTime).TotalSeconds),3)) sec."
     } catch {
@@ -1289,6 +1389,7 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
             UpdatesHT = $null
             RemovedHT = $null
             DatabaseParamsHT = @{}
+            DbStateAsOfTick = 0
             ClassMarkersFound = $false
             LoadedFormat = $mainLoadedFormat
             MainFileLoadedDT = $null
@@ -1394,6 +1495,11 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
                 if (-Not ($resultData.DatabaseParamsHT -is [System.Collections.IDictionary])) {
                     $resultData.DatabaseParamsHT = @{}
                 }
+                # Restoring the state watermark (absent in files written by older versions - stays 0)
+                $dbStateTick = $resultData.RemovedHT["___DBSTATEASTOFTICK___"]
+                if ($null -ne $dbStateTick) { $resultData.DbStateAsOfTick = [long]$dbStateTick }
+                # Strip the marker so it does not leak into the live RemovedHT as a tombstone
+                $resultData.RemovedHT.Remove("___DBSTATEASTOFTICK___")
             } else {
                 $resultData.Success = $false
                 $resultData.ErrorLevel = "LFX6"
@@ -1422,115 +1528,101 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
  $Script:HashtableDB1Class_SaveTxLogScriptBlock = {
     param(
         [object] $thisObj,
-        [object] $keyToTick,
-        [object]   $tickToKeys,
-        [string]   $txLogFolder
+        [string] $txLogFolder
     )
-    # Determine ticks that have NOT been persisted yet
-    $cutoffTick = $thisObj.LastTransactionLogSavedTimestamp
-    $deltaChanges = @{}
-    $firstTick = [long]::MaxValue
-    $lastTick  = [long]::MinValue
-    # Lock TickToKeys to prevent InvalidOperationException during concurrent Add/Remove
-    [System.Threading.Monitor]::Enter($thisObj.TickToKeysLock)
+    # Serialize ALL invocations (sync inline runs + background runspace): the sync path does not
+    # register itself in the async state container, so this lock is the only mutual-exclusion point
+    [System.Threading.Monitor]::Enter($thisObj.TxLogSaveLock)
     try {
-        foreach ($tick in $tickToKeys.Keys) {
-            if ($tick -le $cutoffTick) { continue }
-            # Track min/max ticks during enumeration to avoid slow extra LINQ passes
-            if ($tick -lt $firstTick) { $firstTick = $tick }
-            if ($tick -gt $lastTick) { $lastTick = $tick }
-            foreach ($entry in $tickToKeys[$tick]) {
-                # $entry is Tuple<string, string> (Key, Op). Tuple instead of a PS hashtable literal:
-                # direct .NET allocation without PSObject wrapping - much faster on bulk deltas
-                $deltaChanges[$entry.Item1] = [System.Tuple]::Create($tick, $entry.Item2)
-            }
+        # Single native pass over the per-key op map: collect records newer than the persisted
+        # cutoff. Entries carry values captured at op-registration time, so they are exact replay
+        # records - no value re-read from MergedHT, no phantom nulls under concurrent removes
+        $pack = [PSObjectJsonConverter]::CollectPendingTxEntries($thisObj.KeyToTx, $thisObj.LastTransactionLogSavedTimestamp)
+        $txList = $pack[0]
+        $firstTick = [long]$pack[1]
+        $lastTick = [long]$pack[2]
+        # nothing new to write
+        if ($txList.Count -eq 0) { return }
+        # Ensure destination folder exists
+        if (-not [System.IO.Directory]::Exists($txLogFolder)) {
+            $null = [System.IO.Directory]::CreateDirectory($txLogFolder)
         }
-    } finally {
-        [System.Threading.Monitor]::Exit($thisObj.TickToKeysLock)
-    }
-    # nothing new to write
-    if ($deltaChanges.Count -eq 0) { return }
-    # Build the transaction-log array using lightweight arrays instead of PSCustomObject for performance
-    $txList = [System.Collections.Generic.List[object]]::new()
-    # Cache MergedHT reference to avoid expensive property resolution in tight loop
-    $mergedHT = $thisObj.MergedHT
-    foreach ($kv in $deltaChanges.GetEnumerator()) {
-        $key  = $kv.Key
-        $tick = $kv.Value.Item1
-        $op   = $kv.Value.Item2
-        $value = $null
-        if ($op -eq 'A') {
-            $null = $mergedHT.TryGetValue($key, [ref]$value)
-        }
-        $txList.Add(@($op, $key, $value, $tick))
-    }
-    # Ensure destination folder exists
-    if (-not [System.IO.Directory]::Exists($txLogFolder)) {
-        $null = [System.IO.Directory]::CreateDirectory($txLogFolder)
-    }
-    $fileName = "$($thisObj.DatabaseFileName)_$firstTick`_$lastTick.txlog"
-    $fullPath = Join-Path $txLogFolder $fileName
-    $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
-    $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
-    # Disable escaping of <, > and non-ASCII to reduce TxLog size
-    $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
-    # Writer depth limit aligned with the save path (see the save scriptblock for the rationale)
-    $jsonOptions.MaxDepth = 128
-    # 1MB write buffer: fewer larger write syscalls for big delta batches
-    $stream = [System.IO.File]::Create($fullPath, 1048576)
-    try {
-        [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$txList, $jsonOptions)
-    } finally {
-        $stream.Dispose()
-    }
-    # Update the "last saved" tick
-    $thisObj.LastTransactionLogSavedTimestamp = $lastTick
-    # Cleanup in-memory structures and old TxLog files according to retention
-    if ($thisObj.TxLogRetentionDays -gt 0) {
-        $cutoffDate = [datetime]::UtcNow.AddDays(-$thisObj.TxLogRetentionDays)
-        $cutoffFileTime = $cutoffDate.ToFileTimeUtc()
-        # Snapshot keys to avoid InvalidOperation during enumeration-modification.
-        $ktRef = $thisObj.KeyToTick
-        $keysSnapshot = @($ktRef.Keys)
-        foreach ($k in $keysSnapshot) {
-            $tickVal = [long]0
-            if ($ktRef.TryGetValue($k, [ref]$tickVal) -and $tickVal -lt $cutoffFileTime) {
-                $null = $ktRef.TryRemove($k, [ref]$tickVal)
-            }
-        }
-        [System.Threading.Monitor]::Enter($thisObj.TickToKeysLock)
+        # Atomic write: tmp + rename, same pattern as the main DB save. A crash mid-write can only
+        # leave an orphan .tmp, never a torn .txlog, so file ranges stay strictly increasing and
+        # non-overlapping for replay (ticks are monotonic and the cutoff advances only on success)
+        $fileName = "$($thisObj.DatabaseFileName)_$firstTick`_$lastTick.txlog"
+        $fullPath = Join-Path $txLogFolder $fileName
+        $tmpPath = "$fullPath.tmp"
+        $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
+        $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
+        # Disable escaping of <, > and non-ASCII to reduce TxLog size
+        $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+        # Writer depth limit aligned with the save path (see the save scriptblock for the rationale)
+        $jsonOptions.MaxDepth = 128
+        # 1MB write buffer: fewer larger write syscalls for big delta batches
+        $stream = [System.IO.File]::Create($tmpPath, 1048576)
         try {
-            $ticksSnapshot = @($thisObj.TickToKeys.Keys)
-            foreach ($t in $ticksSnapshot) {
-                if ($t -lt $cutoffFileTime) { $thisObj.TickToKeys.Remove($t) }
-            }
+            [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$txList, $jsonOptions)
+            # Durability option: force bytes to physical disk before the file becomes visible - the
+            # point of a recovery log. Costs an I/O stall; opt-in, off for pure sync usage
+            if ($thisObj.TxLogFlushToDisk) { $stream.Flush($true) }
         } finally {
-            [System.Threading.Monitor]::Exit($thisObj.TickToKeysLock)
+            $stream.Dispose()
         }
-        # File cleanup shares the same retention guard; cutoff derived from the already computed date
-        $rx = [regex]::new('^' + [regex]::Escape($thisObj.DatabaseFileName) + '_(\d+)_(\d+)\.txlog$')
-        $cutoff = $cutoffDate.ToLocalTime()
-        # Regex check first (pure CPU, no I/O), GetLastWriteTime avoids FileInfo allocation
-        foreach ($f in [System.IO.Directory]::GetFiles($txLogFolder, "*.txlog")) {
-            $fileName = [System.IO.Path]::GetFileName($f)
-            if ($rx.IsMatch($fileName) -and [System.IO.File]::GetLastWriteTime($f) -lt $cutoff) {
-                for ($attempt = 0; $attempt -lt 3; $attempt++) {
-                    try {
-                        [System.IO.File]::Delete($f)
-                        Write-Verbose "Deleted old TxLog: $fileName"
-                        break
-                    } catch [System.IO.IOException] {
-                        Start-Sleep -Milliseconds 100
-                        if ($attempt -eq 2) {
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                if ([System.IO.File]::Exists($fullPath)) { [System.IO.File]::Delete($fullPath) }
+                [System.IO.File]::Move($tmpPath, $fullPath)
+                break
+            } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+                Start-Sleep -Milliseconds 100
+                if ($i -eq 4) { throw }
+            }
+        }
+        # Advance cutoff, compat tick and trim the in-memory map ONLY after a successful commit.
+        # On any failure above, records stay pending and the next save rewrites the same tick range
+        # under the same file name (idempotent overwrite)
+        $thisObj.LastTransactionLogSavedTimestamp = $lastTick
+        $thisObj.LastTxLogTick = $lastTick
+        $null = [PSObjectJsonConverter]::TrimSavedTxEntries($thisObj.KeyToTx, $lastTick)
+        # GC orphaned .tmp files (crash leftovers). The age guard covers a foreign in-flight writer -
+        # another DB instance with the same name/folder holds its own TxLogSaveLock object
+        $rxTmp = [regex]::new('^' + [regex]::Escape($thisObj.DatabaseFileName) + '_\d+_\d+\.txlog\.tmp$')
+        $tmpCutoff = [datetime]::Now.AddHours(-1)
+        foreach ($f in [System.IO.Directory]::GetFiles($txLogFolder, "*.txlog.tmp")) {
+            if ($rxTmp.IsMatch([System.IO.Path]::GetFileName($f)) -and [System.IO.File]::GetLastWriteTime($f) -lt $tmpCutoff) {
+                try { [System.IO.File]::Delete($f) } catch { }
+            }
+        }
+        # Retention governs FILES ONLY: the in-memory map is already bounded by the trim above (it
+        # holds only the unsaved delta, not a retention window of history). Regex check first (pure
+        # CPU, no I/O), GetLastWriteTime avoids FileInfo allocation
+        if ($thisObj.TxLogRetentionDays -gt 0) {
+            $cutoff = [datetime]::UtcNow.AddDays(-$thisObj.TxLogRetentionDays).ToLocalTime()
+            $rx = [regex]::new('^' + [regex]::Escape($thisObj.DatabaseFileName) + '_(\d+)_(\d+)\.txlog$')
+            foreach ($f in [System.IO.Directory]::GetFiles($txLogFolder, "*.txlog")) {
+                $fileName = [System.IO.Path]::GetFileName($f)
+                if ($rx.IsMatch($fileName) -and [System.IO.File]::GetLastWriteTime($f) -lt $cutoff) {
+                    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                        try {
+                            [System.IO.File]::Delete($f)
+                            Write-Verbose "Deleted old TxLog: $fileName"
+                            break
+                        } catch [System.IO.IOException] {
+                            Start-Sleep -Milliseconds 100
+                            if ($attempt -eq 2) {
+                                Write-Warning "Failed to delete old TxLog $($f): $($_.Exception.Message)"
+                            }
+                        } catch {
                             Write-Warning "Failed to delete old TxLog $($f): $($_.Exception.Message)"
+                            break
                         }
-                    } catch {
-                        Write-Warning "Failed to delete old TxLog $($f): $($_.Exception.Message)"
-                        break
                     }
                 }
             }
         }
+    } finally {
+        [System.Threading.Monitor]::Exit($thisObj.TxLogSaveLock)
     }
 } # End of SaveTxLogScriptBlock
 
@@ -1587,85 +1679,6 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     return $null
 }
 
-# Restores PowerShell class instances from '~C' markers left by PSObjectJsonConverter. Iterative stack-based traversal (no recursion) - immune to PowerShell call-depth overflow. A visited set guards against cyclic references (e.g. graphs restored from CLIXML <Obj Ref> nodes by PSSerializer.Deserialize): an already-visited container is still rehydrated ('~C'), but is never descended into again, so the traversal always terminates on cyclic data.
- $Script:HashtableDB1Class_RestoreClassesScriptBlock = {
-    param([object]$Node)
-    if ($null -eq $Node) { return $null }
-    $result = $Node
-    # Reference-identity set of visited container nodes (hashtable/array/PSObject use reference equality)
-    $visited = [System.Collections.Generic.HashSet[object]]::new()
-    # Hard iteration limit as a final safety net, sized far above node counts of large databases
-    $maxIterations = 5000000
-    $iterations = 0
-    # Frame: Parent (container or $null for the root), Slot (key / index / property name), Node, Phase (0=descend, 1=rehydrate)
-    $stack = [System.Collections.Generic.Stack[hashtable]]::new()
-    $stack.Push(@{ Parent = $null; Slot = $null; Node = $Node; Phase = 0 })
-    while ($stack.Count -gt 0) {
-        $iterations++
-        if ($iterations -gt $maxIterations) {
-            $peekNode = $stack.Peek().Node
-            Write-Warning "RestoreClasses: iteration limit ($maxIterations) exceeded - possible cyclic reference. Current node type: $(if ($null -ne $peekNode) { $peekNode.GetType().FullName } else { 'null' })"
-            break
-        }
-        $frame = $stack.Pop()
-        $node = $frame.Node
-        if ($null -eq $node) { continue }
-        if ($frame.Phase -eq 1) {
-            # Phase 1: children are already restored - rehydrate the class and replace it in the parent
-            $rehydrated = & $Script:HashtableDB1Class_TryRehydrateScriptBlock $node
-            if ($null -ne $rehydrated) {
-                $parent = $frame.Parent
-                $slot = $frame.Slot
-                if ($null -eq $parent) {
-                    $result = $rehydrated
-                } elseif ($parent -is [System.Collections.IDictionary]) {
-                    $parent[$slot] = $rehydrated
-                } elseif ($parent -is [System.Array]) {
-                    $parent[$slot] = $rehydrated
-                } else {
-                    try { $parent."$slot" = $rehydrated } catch { }
-                }
-            }
-            continue
-        }
-        # Phase 0: descend into containers
-        if ($node -is [System.Collections.IDictionary]) {
-            $wasVisited = -not $visited.Add($node)
-            # Push the rehydrate frame first so it pops after all children (LIFO). Re-visited (aliased/cyclic) hashtables still get rehydrated, but are not descended into again - their children are the same objects and are already restored.
-            $stack.Push(@{ Parent = $frame.Parent; Slot = $frame.Slot; Node = $node; Phase = 1 })
-            if (-not $wasVisited) {
-                foreach ($k in @($node.Keys)) {
-                    $child = $node[$k]
-                    if ($null -ne $child) {
-                        $stack.Push(@{ Parent = $node; Slot = $k; Node = $child; Phase = 0 })
-                    }
-                }
-            }
-        } elseif ($node -is [System.Array]) {
-            $wasVisited = -not $visited.Add($node)
-            if (-not $wasVisited) {
-                for ($i = 0; $i -lt $node.Length; $i++) {
-                    $child = $node[$i]
-                    if ($null -ne $child) {
-                        $stack.Push(@{ Parent = $node; Slot = $i; Node = $child; Phase = 0 })
-                    }
-                }
-            }
-        } elseif ($node -is [pscustomobject]) {
-            $wasVisited = -not $visited.Add($node)
-            if (-not $wasVisited) {
-                foreach ($p in @($node.PSObject.Properties)) {
-                    if ($p.IsSettable -and $null -ne $p.Value) {
-                        $stack.Push(@{ Parent = $node; Slot = $p.Name; Node = $p.Value; Phase = 0 })
-                    }
-                }
-            }
-        }
-    }
-    # Note! Comma-wrap: prevents PowerShell output enumeration from collapsing an empty array root into $null
-    return ,$result
-} # End of RestoreClassesScriptBlock
-
 # Async load composite: keeps ALL heavy work (deserialization, ConcurrentDictionary building, TxLog state reset,
 # '~C' node collection) inside the background runspace, so the InvocationStateChanged event action in the main
 # session stays lightweight and does not freeze the GUI script. Class rehydration itself cannot run here
@@ -1698,26 +1711,25 @@ foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMa
     $thisObj.MainFileLoadedDT = $loadResult.MainFileLoadedDT
     $thisObj.UpdatesFileLoadedDT = $loadResult.UpdatesFileLoadedDT
     $thisObj.RemovedFileLoadedDT = $loadResult.RemovedFileLoadedDT
+    # Restore the state watermark and keep future ticks strictly above it: a machine with a lagging
+    # clock must not issue ticks below the loaded state (LWW/sync correctness)
+    $thisObj.DbStateAsOfTick = $loadResult.DbStateAsOfTick
+    $thisObj.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
     # Rebuild merged hashtable, then assign atomically (C# helper - fast)
     $thisObj.MergedHT = [PSObjectJsonConverter]::BuildMergedDictionary($thisObj.MainHT, $thisObj.UpdatesHT, $thisObj.RemovedHT)
-    # Clear TxLog in-memory state since DB state is fully replaced by loaded data
-    if ($thisObj.EnableTransactionLog) {
-        $thisObj.KeyToTick.Clear()
-        [System.Threading.Monitor]::Enter($thisObj.TickToKeysLock)
-        try {
-            $thisObj.TickToKeys.Clear()
-        } finally {
-            [System.Threading.Monitor]::Exit($thisObj.TickToKeysLock)
-        }
-        $thisObj.LastTransactionLogSavedTimestamp = 0
-    }
+    # Clear TxLog in-memory state since DB state is fully replaced by loaded data (unconditional: a
+    # later EnableTransactionLog must not see pre-load leftovers)
+    $thisObj.KeyToTx.Clear()
+    $thisObj.LastTransactionLogSavedTimestamp = 0
     # Phase 3 (background, cheap): collect '~C' hashtable nodes for main-session rehydration.
     # Skipped entirely when the converter saw no '~C' markers during Phase 1 (same thread) - the
     # full-tree traversal is the most expensive post-load step for large class-free datasets.
     # Nodes are appended in DFS order (containers before children); the event action processes the list
     # in reverse so nested instances are rehydrated before their containers copy them out of raw hashtables.
-    $pending = [PSObjectJsonConverter]::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
-    $loadResult['PendingClassNodes'] = $pending
+    if ($loadResult.ClassMarkersFound) {
+        $pending = [PSObjectJsonConverter]::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
+        $loadResult['PendingClassNodes'] = $pending
+    }
     return $loadResult
 } # End of LoadAsyncScriptBlock
 
@@ -1807,16 +1819,28 @@ Class HashTableDB1 {
     [bool]   $EnableTransactionLog           = $false
     # Number of days to keep TXLogs
     [int]    $TxLogRetentionDays   = 3
-    # Key -> tick (FileTimeUtc). ConcurrentDictionary for thread-safe Add/Remove/SaveTxLog interaction.
-    [System.Collections.Concurrent.ConcurrentDictionary[string, long]] $KeyToTick = [System.Collections.Concurrent.ConcurrentDictionary[string, long]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    # Lock object protecting TickToKeys (SortedDictionary is not thread-safe).
-    hidden [object] $TickToKeysLock = [object]::new()
-    # Tick -> list of <key,op> entries. SortedDictionary gives chronological iteration for TxLog.
-    hidden [System.Collections.Generic.SortedDictionary[long, System.Collections.Generic.List[object]]] $TickToKeys = [System.Collections.Generic.SortedDictionary[long, System.Collections.Generic.List[object]]]::new()
+    # Key -> Tuple(tick, op, value) of the LAST registered operation, captured at op time. Lock-free:
+    # a plain CD overwrite is last-write-wins per key - exactly what the delta-state txlog format
+    # stores. Memory is bounded by distinct keys and trimmed after every successful txlog write; the
+    # map doubles as LWW bookkeeping for future replay/sync conflict resolution.
+    [System.Collections.Concurrent.ConcurrentDictionary[string, object]] $KeyToTx = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # Monotonic tick source (TxTickGenerator from the Add-Type block; typed [object] because class
+    # members bind type literals at compile time, before Add-Type executes). Created in the ctor.
+    hidden [object] $TxTickGenerator = $null
+    # Serializes sync + async invocations of the TxLog save scriptblock: the sync path is invisible
+    # to the async state container's WaitFor, so the lock is the only mutual-exclusion point
+    hidden [object] $TxLogSaveLock = [object]::new()
     # Tick of the latest entry that has already been persisted to a TxLog file
     [long]   $LastTransactionLogSavedTimestamp  = 0
-    # Last tick point written in a TxLog (retained for external API compatibility)
+    # Last tick point written to a TxLog file
     [long]   $LastTxLogTick        = 0
+    # Watermark: all ops with tick <= this value are reflected in the saved DB files (persisted as
+    # ___DBSTATEASTOFTICK___ inside the deletes file, restored on load). Replay/sync must apply only
+    # entries with a newer tick
+    [long]   $DbStateAsOfTick      = 0
+    # Opt-in fsync of a txlog file before it becomes visible (recovery-critical deployments; costs
+    # an I/O stall per write). Off by default - pure sync usage does not need it
+    [bool]   $TxLogFlushToDisk     = $false
     # Max lock file wait time (seconds)
     [int] $LockFileMaxWaitTime = 30
     # Object used for SaveToXMLAsync
@@ -1835,6 +1859,10 @@ Class HashTableDB1 {
     # Constructor - initialize async components
     HashTableDB1() {
         $this.AsyncResults = [hashtable]::Synchronized(@{})
+        # Activator instead of a type literal: class bodies bind type literals at compile time,
+        # before Add-Type has executed
+        $tickGenType = 'TxTickGenerator' -as [type]
+        if ($tickGenType) { $this.TxTickGenerator = [System.Activator]::CreateInstance($tickGenType) }
     }
     # Creates empty database
     [void] CreateEmptyDB() {
@@ -1846,36 +1874,32 @@ Class HashTableDB1 {
         $this.UpdatesFileLoadedDT = $null
         $this.RemovedFileLoadedDT = $null
         $this.DatabaseParamsHT = @{}
+        # TxLog state reset (the load and compact paths do the same): an empty DB has no pending ops
+        # and no persisted watermark. The generator watermark is NOT reset - it stays process-monotonic
+        $this.KeyToTx.Clear()
+        $this.LastTransactionLogSavedTimestamp = 0
+        $this.DbStateAsOfTick = 0
     }
-    # Registers a single key operation in the in-memory TxLog structures (KeyToTick + TickToKeys under
-    # Monitor). Shared by Add / Remove / UpsertNestedHashTableKey / RemoveNestedHashTableKey - previously
-    # four copy-pasted blocks. The EnableTransactionLog guard stays at each call site: moving it inside
-    # would add a method call to every hot-path write even when TxLog is disabled.
-    # Tuple instead of a PS object: direct .NET allocation, fast in tight loops.
-    hidden [void] RegisterTxOp([string]$keyName, [string]$op) {
-        $nowTick = [datetime]::UtcNow.ToFileTimeUtc()
-        $this.KeyToTick[$keyName] = $nowTick
-        # Atomic insert-or-get to avoid lost list on race
-        $list = $null
-        [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-        try {
-            if (-not $this.TickToKeys.TryGetValue($nowTick, [ref]$list)) {
-                $list = [System.Collections.Generic.List[object]]::new()
-                $this.TickToKeys[$nowTick] = $list
-            }
-            $list.Add([System.Tuple]::Create($keyName, $op))
-        } finally {
-            [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-        }
+    # Registers the LAST operation for a key in the lock-free per-key op map. Shared by Add / Remove /
+    # UpsertNestedHashTableKey / RemoveNestedHashTableKey. The EnableTransactionLog guard stays at each
+    # call site: moving it inside would add a method call to every hot-path write even when TxLog is
+    # disabled. The value is captured HERE, at op time, so txlog entries are exact replay records (no
+    # phantom nulls from later concurrent removes). MUST be called AFTER the state writes
+    # (UpdatesHT/MergedHT/RemovedHT): the save path reads the generator watermark as the state
+    # watermark and relies on state-before-tick ordering. Closed generic Tuple type: keeps the record
+    # shape stable for the C# helpers regardless of the value's runtime type.
+    hidden [void] RegisterTxOp([string]$keyName, [string]$op, [object]$value) {
+        $nowTick = $this.TxTickGenerator.Next()
+        $this.KeyToTx[$keyName] = [System.Tuple[long,string,object]]::new($nowTick, $op, $value)
     }
     # Adds record to a database
     [void] Add($KeyName, $HashValue) {
         $this.UpdatesHT[$KeyName] = $HashValue
         $this.MergedHT[$KeyName] = $HashValue
         $null = $this.RemovedHT.TryRemove($KeyName, [ref]$null)
-        # TxLog entries - store operation type "A"
+        # TxLog entries - store operation type "A" with the value captured at op time
         if ($this.EnableTransactionLog) {
-            $this.RegisterTxOp($KeyName, 'A')
+            $this.RegisterTxOp($KeyName, 'A', $HashValue)
         }
     }
     # Removes record from a database
@@ -1883,15 +1907,15 @@ Class HashTableDB1 {
         $null = $this.MergedHT.TryRemove($KeyName, [ref]$null)
         $null = $this.UpdatesHT.TryRemove($KeyName, [ref]$null)
         $this.RemovedHT[$KeyName] = 1
-        # TxLog entries - store operation type "R"
+        # TxLog entries - store operation type "R" (no value - tombstone)
         if ($this.EnableTransactionLog) {
-            $this.RegisterTxOp($KeyName, 'R')
+            $this.RegisterTxOp($KeyName, 'R', $null)
         }
     }
     # Adds secondary key to hashtable database
     [void] UpsertNestedHashTableKey($KeyName, $SecondaryKey, $SecondaryKeyValue=1) {
         # Atomic upsert via TryAdd + CAS TryUpdate pattern to prevent lost updates under concurrency
-        $updated = $false
+        $updated = $false; $newValue = $null
         $casRetries = 0
         while (-not $updated -and $casRetries -lt 100) {
             $casRetries++
@@ -1928,14 +1952,14 @@ Class HashTableDB1 {
         if (-not $updated) {
             throw "Failed to update key '$KeyName' after 100 retries due to concurrent modifications."
         }
-        # TxLog entry if enabled
+        # TxLog entry if enabled - the applied nested hashtable snapshot is the captured value
         if ($this.EnableTransactionLog) {
-            $this.RegisterTxOp($KeyName, 'A')
+            $this.RegisterTxOp($KeyName, 'A', $newValue)
         }
     }
     # Removes secondary key from hashtable database
     [void] RemoveNestedHashTableKey($KeyName, $SecondaryKey) {
-        $updated = $false
+        $updated = $false; $newVal = $null
         $casRetries = 0
         while (-not $updated -and $casRetries -lt 100) {
             $casRetries++
@@ -1965,9 +1989,9 @@ Class HashTableDB1 {
         if (-not $updated) {
             throw "Failed to remove secondary key '$SecondaryKey' from '$KeyName' after 100 retries due to concurrent modifications."
         }
-        # TxLog entry if enabled
+        # TxLog entry if enabled - the applied nested hashtable snapshot is the captured value
         if ($this.EnableTransactionLog) {
-            $this.RegisterTxOp($KeyName, 'A')
+            $this.RegisterTxOp($KeyName, 'A', $newVal)
         }
     }
     # Gets record from database. TryGetValue instead of the raw indexer: the indexer throws
@@ -2021,33 +2045,31 @@ Class HashTableDB1 {
         $this.UpdatesFileLoadedDT = $dateTimeNow
         $this.RemovedFileLoadedDT = $dateTimeNow
         $this.IsForceSaveMain = $true
-        # Clear TxLog in-memory state because full state is now persisted in MainHT
-        if ($this.EnableTransactionLog) {
-            $this.KeyToTick.Clear()
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                $this.TickToKeys.Clear()
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
-        }
+        # Clear TxLog state: full state is now in MainHT and the following save persists it together
+        # with a fresh ___DBSTATEASTOFTICK___ watermark. The cutoff is kept - new ticks are strictly
+        # above it, so the txlog file chain continues without a gap. Unconditional: a later
+        # EnableTransactionLog must not see pre-compact leftovers
+        $this.KeyToTx.Clear()
     }
-    # Synchronous save - re-uses the exact same script block but runs it directly on the calling thread (no runspace, no event handling).
-    [void] SaveToDisk() {
-        if ($this.ReadOnlyMode) { return }
+    # Shared save prologue for SaveToDisk/SaveToDiskAsync: resets error state, waits out the previous
+    # async save BEFORE Compact (its finally-block resets the IsForceSaveMain flag that Compact sets),
+    # compacts when pending changes exceed 30% of main, and forces a main rewrite when the file is missing.
+    hidden [void] PrepareSave() {
         $this.ErrorLevel = $null
         $this.ErrorText  = $null
-        # Storage format extension for the main-file existence check
         $mainExt = 'json'
         if ($this.StorageFormat -eq 'Xml') { $mainExt = 'xml' }
         $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.$mainExt"
-        # Wait for previous async save BEFORE Consolidate to prevent its finally-block from resetting IsForceSaveMain that Consolidate sets
         $this.WaitForAsyncSaveToDisk()
-        # If updates database is bigger than 30% of main database
         if ($this.MainHT.Count * 0.3 -lt $this.GetPendingChangesCount()) {
             $this.CompactDatabase()
         }
         if (-not [System.IO.File]::Exists($mainPath)) { $this.IsForceSaveMain = $true }
+    }
+    # Synchronous save - re-uses the exact same script block but runs it directly on the calling thread (no runspace, no event handling).
+    [void] SaveToDisk() {
+        if ($this.ReadOnlyMode) { return }
+        $this.PrepareSave()
         # Snapshot references the live CD instances. ConcurrentDictionary guarantees atomic per-key reads, and CompactDatabase() swaps whole CD instances atomically, so iteration sees a consistent CD reference.
         $mainSnapshot    = $this.MainHT
         $updatesSnapshot = $this.UpdatesHT
@@ -2067,14 +2089,12 @@ Class HashTableDB1 {
             $this.ErrorLevel = "STX1"
             $this.ErrorText  = $_.Exception.Message
         }
-        # Syn saving TX Log
+        # Sync saving TX Log
         if ($this.EnableTransactionLog) {
             $this.WaitForPendingTransactionLogOperations()
             Try {
-                $ktSnap = $this.KeyToTick
-                $tkSnap = $this.TickToKeys
                 $TxLogsPath = Join-Path $this.DatabaseFolderPath "TxLog"
-                & $Script:HashtableDB1Class_SaveTxLogScriptBlock $this $ktSnap $tkSnap $TxLogsPath
+                & $Script:HashtableDB1Class_SaveTxLogScriptBlock $this $TxLogsPath
             } catch {
                 $this.ErrorLevel = "STXT1"
                 $this.ErrorText  = $_.Exception.Message
@@ -2165,20 +2185,7 @@ Class HashTableDB1 {
     # Asynchronously save database to XML files
     [void] SaveToDiskAsync() {
         if ($this.ReadOnlyMode) { return }
-        $this.ErrorLevel = $null
-        $this.ErrorText  = $null
-        # Storage format extension for the main-file existence check
-        $mainExt = 'json'
-        if ($this.StorageFormat -eq 'Xml') { $mainExt = 'xml' }
-        $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.$mainExt"
-        # Wait for previous async save BEFORE Consolidate to prevent its finally-block from resetting IsForceSaveMain that Consolidate sets
-        $this.WaitForAsyncSaveToDisk()
-        # If updates database is bigger than 30% of main
-        if ($this.MainHT.Count * 0.3 -lt $this.GetPendingChangesCount()) {
-            $this.CompactDatabase()
-        }
-        # If there is no main file - force creating it
-        if (-not [System.IO.File]::Exists($mainPath)) { $this.IsForceSaveMain = $true }
+        $this.PrepareSave()
         # Runspace to save async
         if (-Not $this.AsynchronousSaveOperationState.Pool -or $this.AsynchronousSaveOperationState.Pool.IsDisposed) {
             $poolSaveToXMLAsync = [runspacefactory]::CreateRunspacePool(1,1)
@@ -2277,8 +2284,6 @@ Class HashTableDB1 {
         if ($this.ReadOnlyMode) { return }
         $this.ErrorLevel = $null
         $this.ErrorText  = $null
-        $ktSnap = $this.KeyToTick
-        $tkSnap = $this.TickToKeys
         # Ensure any previous async operation has finished
         $this.WaitForPendingTransactionLogOperations()
         # Runspace to save async
@@ -2293,7 +2298,7 @@ Class HashTableDB1 {
             $this.AsynchronousTransactionLogSaveState.PSInstance = [PowerShell]::Create()
             $this.AsynchronousTransactionLogSaveState.PSInstance.RunspacePool = $SaveTransactionLogAsyncPool
             $TxLogsPath = Join-Path $this.DatabaseFolderPath "TxLog"
-            $null = $this.AsynchronousTransactionLogSaveState.PSInstance.AddScript($Script:HashtableDB1Class_SaveTxLogScriptBlock).AddArgument($this).AddArgument($ktSnap).AddArgument($tkSnap).AddArgument($TxLogsPath)
+            $null = $this.AsynchronousTransactionLogSaveState.PSInstance.AddScript($Script:HashtableDB1Class_SaveTxLogScriptBlock).AddArgument($this).AddArgument($TxLogsPath)
             $asyncResult = $this.AsynchronousTransactionLogSaveState.PSInstance.BeginInvoke()
             $msg = @{
                 AsyncResult = $asyncResult
@@ -2348,41 +2353,7 @@ Class HashTableDB1 {
             if (-not $loadResult.DataIsLoaded) {
                 return $false
             }
-            # Restore PS class instances ('~C' markers) only when the converter detected class markers in the
-            # loaded files. Skipping the full-tree traversal is the main load-time optimization for class-free
-            # datasets. Runs in the current session where user classes are defined, not in the async runspace.
-            # C# traversal + C# rehydration with a PS fallback (parameterless-ctor types are handled natively;
-            # exotic constructors fall back to the PS TryRehydrate scriptblock).
-            if ($loadResult.ClassMarkersFound) {
-                $converterType = 'PSObjectJsonConverter' -as [type]
-                # Standard workaround for class method bodies: NO [PSObjectJsonConverter+...] type literals
-                # here - class methods bind type literals at compile time, before Add-Type has executed.
-                # System.Func is a BCL type (always resolvable); the scriptblock converts to the delegate at runtime.
-                $typeResolver = [Func[string,Type]] { param($className) $className -as [type] }
-                foreach ($rootHT in @($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT)) {
-                    if ($null -eq $rootHT) { continue }
-                    $pendingNodes = $converterType::CollectClassNodes(@($rootHT))
-                    for ($i = $pendingNodes.Count - 1; $i -ge 0; $i--) {
-                        $frame = $pendingNodes[$i]
-                        $node = $frame[2]
-                        $rehydrated = $converterType::RehydrateClassNode($node, $typeResolver)
-                        if ($null -eq $rehydrated) { $rehydrated = & $Script:HashtableDB1Class_TryRehydrateScriptBlock $node }
-                        if ($null -eq $rehydrated) { continue }
-                        $parent = $frame[0]
-                        if ($null -eq $parent) {
-                            # Root itself was a class node: replace the root reference in the result
-                            if ([object]::ReferenceEquals($rootHT, $loadResult.MainHT)) { $loadResult.MainHT = $rehydrated }
-                            elseif ([object]::ReferenceEquals($rootHT, $loadResult.UpdatesHT)) { $loadResult.UpdatesHT = $rehydrated }
-                            elseif ([object]::ReferenceEquals($rootHT, $loadResult.DatabaseParamsHT)) { $loadResult.DatabaseParamsHT = $rehydrated }
-                            continue
-                        }
-                        $slot = $frame[1]
-                        if ($parent -is [System.Collections.IDictionary]) { $parent[$slot] = $rehydrated }
-                        elseif ($parent -is [System.Array]) { $parent[$slot] = $rehydrated }
-                        else { try { $parent."$slot" = $rehydrated } catch { } }
-                    }
-                }
-            }
+
             # Runtime type resolution for dictionary builders (kept from the previous optimization)
             $converterType = 'PSObjectJsonConverter' -as [type]
             if (-not $converterType) { throw "PSObjectJsonConverter type is not loaded. Add-Type failed or was skipped." }
@@ -2406,19 +2377,39 @@ Class HashTableDB1 {
             $this.MainFileLoadedDT = $loadResult.MainFileLoadedDT
             $this.UpdatesFileLoadedDT = $loadResult.UpdatesFileLoadedDT
             $this.RemovedFileLoadedDT = $loadResult.RemovedFileLoadedDT
+            # Restore the state watermark and keep future ticks strictly above it: a machine with a
+            # lagging clock must not issue ticks below the loaded state (LWW/sync correctness)
+            $this.DbStateAsOfTick = $loadResult.DbStateAsOfTick
+            $this.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
             # Rebuild merged hashtable, then assign atomically (C# helper - fast).
             # $converterType was resolved above at runtime for the same compile-time binding reason.
             $this.MergedHT = $converterType::BuildMergedDictionary($this.MainHT, $this.UpdatesHT, $this.RemovedHT)
-            # Clear TxLog in-memory state since DB state is fully replaced by loaded data
-            if ($this.EnableTransactionLog) {
-                $this.KeyToTick.Clear()
-                [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-                try {
-                    $this.TickToKeys.Clear()
-                } finally {
-                    [System.Threading.Monitor]::Exit($this.TickToKeysLock)
+            # Clear TxLog in-memory state since DB state is fully replaced by loaded data (unconditional:
+            # a later EnableTransactionLog must not see pre-load leftovers)
+            $this.KeyToTx.Clear()
+            $this.LastTransactionLogSavedTimestamp = 0
+            # Restore PS class instances ('~C' markers) only when the converter detected class markers in the
+            # loaded files - the main load-time optimization for class-free datasets. Runs AFTER the live
+            # dictionaries are published and uses the same batch pipeline as the async path:
+            # CollectUniqueClassNames resolves each UNIQUE class name once (user classes resolve only in this
+            # session), then RehydratePendingNodes rehydrates all nodes in one native pass with per-type
+            # reflection caches - depth-1 slots are patched straight into the live dictionaries, nested
+            # containers are patched in place (shared by reference with the raw tree). The PS TryRehydrate
+            # scriptblock is the fallback for types without a parameterless constructor.
+            if ($loadResult.ClassMarkersFound) {
+                $pendingNodes = $converterType::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
+                if ($pendingNodes -and $pendingNodes.Count -gt 0) {
+                    $uniqueNames = $converterType::CollectUniqueClassNames($pendingNodes)
+                    $typeMap = [System.Collections.Generic.Dictionary[string,Type]]::new()
+                    foreach ($className in $uniqueNames) {
+                        $resolvedType = $className -as [type]
+                        if ($resolvedType) { $typeMap[$className] = $resolvedType }
+                    }
+                    if ($typeMap.Count -gt 0) {
+                        $psFallback = [System.Func[object,object]] { param($node) & $Script:HashtableDB1Class_TryRehydrateScriptBlock $node }
+                        $null = $converterType::RehydratePendingNodes($pendingNodes, $typeMap, $this.MainHT, $this.UpdatesHT, $this.MergedHT, $this.RemovedHT, $loadResult.MainHT, $loadResult.UpdatesHT, $psFallback)
+                    }
                 }
-                $this.LastTransactionLogSavedTimestamp = 0
             }
             # Cross-format migration: loaded files differ from the class StorageFormat - resave in the
             # current format; the save path archives the old-format files so the folder always holds one format
@@ -2733,18 +2724,9 @@ Class HashTableDB1 {
         if ($null -ne $this.UpdatesHT) { $this.UpdatesHT.Clear(); $this.UpdatesHT = $null }
         if ($null -ne $this.MergedHT) { $this.MergedHT.Clear(); $this.MergedHT = $null }
         if ($null -ne $this.RemovedHT) { $this.RemovedHT.Clear(); $this.RemovedHT = $null }
-        if ($null -ne $this.KeyToTick) {
-            $this.KeyToTick.Clear()
-            $this.KeyToTick = $null
-        }
-        if ($null -ne $this.TickToKeys) {
-            [System.Threading.Monitor]::Enter($this.TickToKeysLock)
-            try {
-                $this.TickToKeys.Clear()
-            } finally {
-                [System.Threading.Monitor]::Exit($this.TickToKeysLock)
-            }
-            $this.TickToKeys = $null
+        if ($null -ne $this.KeyToTx) {
+            $this.KeyToTx.Clear()
+            $this.KeyToTx = $null
         }
     }
     # Clean up resources

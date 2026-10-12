@@ -13,6 +13,7 @@
        - Bulk Read performance
        - Backup rotation (NumOfDbBackupsToKeep)
        - Mutex synchronization during parallel async saves
+       - TxLog correctness: format, LWW, tombstones, chain, trim, watermark, crash-recovery replay
     4. Outputs PASS / FAIL for each step and a summary
        Saves execution timings, memory metrics, and context to a CSV file.
   --------------------------------------------------------------------
@@ -270,6 +271,48 @@ function Wait-ForAsyncResult {
         if ((Get-Date) -gt $deadline) { throw "Timeout waiting for async result" }
         Start-Sleep -Milliseconds 250
     }
+}
+
+# TxLog test helpers: parse txlog files (name range + entries) and replay them
+function Get-TxLogFiles {
+    param(
+        [string] $TxLogFolder,
+        [string] $DbFileName
+    )
+    $result = [System.Collections.Generic.List[object]]::new()
+    if (-not (Test-Path -LiteralPath $TxLogFolder)) { return ,$result }
+    $rx = '^' + [regex]::Escape($DbFileName) + '_(\d+)_(\d+)\.txlog$'
+    $options = [System.Text.Json.JsonSerializerOptions]::new()
+    $options.Converters.Add([PSObjectJsonConverter]::new())
+    foreach ($f in (Get-ChildItem -LiteralPath $TxLogFolder -Filter '*.txlog' | Sort-Object Name)) {
+        if ($f.Name -match $rx) {
+            $entries = [System.Text.Json.JsonSerializer]::Deserialize([System.IO.File]::ReadAllText($f.FullName), [object], $options)
+            $result.Add([pscustomobject]@{ Name = $f.Name; FirstTick = [long]$Matches[1]; LastTick = [long]$Matches[2]; Entries = $entries })
+        }
+    }
+    return ,$result
+}
+
+# Prototypes the future recovery path: files in firstTick order, whole-file skip below the watermark,
+# per-entry tick filter and idempotent Add/Remove application. A real sync consumer must apply
+# entries WITHOUT re-registering local TxOps (echo) - Add/Remove here are fine because the scratch
+# instance under replay is never saved.
+function Invoke-TxLogReplay {
+    param(
+        [HashTableDB1] $Db,
+        [long] $FromTick,
+        [string] $TxLogFolder
+    )
+    $applied = 0
+    foreach ($f in (Get-TxLogFiles -TxLogFolder $TxLogFolder -DbFileName $Db.DatabaseFileName)) {
+        if ($f.FirstTick -le $FromTick -and $f.LastTick -le $FromTick) { continue }
+        foreach ($e in @($f.Entries)) {
+            if ([long]$e[3] -le $FromTick) { continue }
+            if ("$($e[0])" -eq 'R') { $Db.Remove("$($e[1])") } else { $Db.Add("$($e[1])", $e[2]) }
+            $applied++
+        }
+    }
+    return $applied
 }
 Write-Host "Selected storage format: $StorageFormatToTest"
 # -------------------------------------------------
@@ -953,6 +996,161 @@ if ($db14c.Get('tf_ClassInstance') -isnot [TstCertContainer] -or $db14c.Get('tf_
 
 if (-not $ok14 -or -not $typeFidelityOk) { Write-Host "FAIL: Type fidelity round-trip failed" -ForegroundColor Red; $AllOk = $false } else { Write-Host "PASS: Type fidelity round-trip OK" -ForegroundColor Green }
 }
+
+# 2.15 Test 15 - TxLog correctness: format, LWW, tombstones, chain, trim, watermark, replay
+Write-Host "`n=== Test 15 - TxLog correctness & crash-recovery replay ===" -ForegroundColor Cyan
+ $folder15 = Join-Path $BasePath '15_TxLog'
+New-Item -ItemType Directory -Path $folder15 | Out-Null
+ $tx15Folder = Join-Path $folder15 'TxLog'
+ $db15 = New-TestDB -Folder $folder15 -BackupCount 0
+ $tx15Ok = $true
+
+# Baseline: 100 records compacted into main so later phases never cross the auto-consolidate
+# threshold (an empty main would force a compact on every save and clear the pending TxLog ops)
+foreach ($item in $Script:Data100) { $db15.Add($item.Key, $item.Value) }
+ $db15.CompactDatabase()
+ $db15.SaveToDisk()
+
+# --- Phase A: every registration path, then sync save #1 ---
+ $db15.Add('tx_A', 'vA1')
+ $db15.Add('tx_B', 'vB1')
+ $db15.Add('tx_C', 'vC1')
+ $db15.Remove('tx_B')                                  # A -> R: tombstone wins over the earlier add
+ $db15.Add('tx_A', 'vA2')                              # A -> A: LWW - the first value must be gone
+ $db15.UpsertNestedHashTableKey('tx_N', 'sub1', 11)    # nested upsert: captured value = whole hashtable
+ $db15.UpsertNestedHashTableKey('tx_N', 'sub2', 22)
+
+ $sw.Restart()
+ $db15.SaveToDisk()
+ $sw.Stop()
+ $tx15A = Get-TxLogFiles -TxLogFolder $tx15Folder -DbFileName 'TestDB'
+ $phaseOk = $true
+if ($db15.KeyToTx.Count -ne 0) { Write-Host "FAIL: KeyToTx not trimmed after save #1 (Count=$($db15.KeyToTx.Count))" -ForegroundColor Red; $phaseOk = $false }
+if ($tx15A.Count -ne 1) { Write-Host "FAIL: expected 1 txlog file after save #1, got $($tx15A.Count)" -ForegroundColor Red; $phaseOk = $false }
+if ($phaseOk) {
+    $f1 = $tx15A[0]
+    $e1 = @($f1.Entries)
+    if ($e1.Count -ne 4) { Write-Host "FAIL: expected 4 entries (per-key dedup), got $($e1.Count)" -ForegroundColor Red; $phaseOk = $false }
+    $byKey = @{}
+    $minTick = [long]::MaxValue
+    $maxTick = [long]::MinValue
+    foreach ($e in $e1) {
+        $byKey["$($e[1])"] = $e
+        $t = [long]$e[3]
+        if ($t -lt $minTick) { $minTick = $t }
+        if ($t -gt $maxTick) { $maxTick = $t }
+    }
+    if ($minTick -ne $f1.FirstTick -or $maxTick -ne $f1.LastTick) { Write-Host "FAIL: file name range ($($f1.FirstTick)..$($f1.LastTick)) != entry ticks ($minTick..$maxTick)" -ForegroundColor Red; $phaseOk = $false }
+    if ("$($byKey['tx_A'][2])" -ne 'vA2') { Write-Host "FAIL: tx_A LWW broken - expected 'vA2', got '$($byKey['tx_A'][2])'" -ForegroundColor Red; $phaseOk = $false }
+    if ("$($byKey['tx_B'][0])" -ne 'R' -or $null -ne $byKey['tx_B'][2]) { Write-Host "FAIL: tx_B tombstone broken (op=$($byKey['tx_B'][0]))" -ForegroundColor Red; $phaseOk = $false }
+    $nVal = $byKey['tx_N'][2]
+    if (-not ($nVal -is [System.Collections.IDictionary]) -or $nVal['sub1'] -ne 11 -or $nVal['sub2'] -ne 22) { Write-Host "FAIL: tx_N nested capture broken" -ForegroundColor Red; $phaseOk = $false }
+    if ("$($byKey['tx_C'][0])" -ne 'A' -or "$($byKey['tx_C'][2])" -ne 'vC1') { Write-Host "FAIL: tx_C entry broken" -ForegroundColor Red; $phaseOk = $false }
+    if ($db15.DbStateAsOfTick -lt $maxTick) { Write-Host "FAIL: DbStateAsOfTick ($($db15.DbStateAsOfTick)) < max entry tick ($maxTick)" -ForegroundColor Red; $phaseOk = $false }
+}
+Add-TestMetric -TestName "Test 15" -Operation "TxLog save #1 (format/LWW/tombstone)" -Context "Saves 4 pending keys (plain A, A-then-R tombstone, A-then-A last-write-wins, nested-upsert hashtable capture) and validates the txlog file: (op,key,value,tick) shape, value captured at op time, null tombstone value, per-key dedup, file-name range equal to entry ticks, in-memory map trim and the save-published watermark." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($phaseOk){"OK"}else{"FAIL"})
+if (-not $phaseOk) { $tx15Ok = $false }
+ $W1 = $db15.DbStateAsOfTick
+
+# Snapshot the save-#1 files BEFORE later saves overwrite them - this is the "recovered disk
+# state" the Phase E replay starts from
+ $replayBase = Join-Path $BasePath '15_TxLog_replay_base'
+ $dbExt15 = 'json'
+if ($StorageFormatToTest -eq 'Xml') { $dbExt15 = 'xml' }
+New-Item -ItemType Directory -Path $replayBase -Force | Out-Null
+foreach ($suffix in 'main','updates','deletes') {
+    Copy-Item (Join-Path $folder15 "TestDB_$suffix.$dbExt15") (Join-Path $replayBase "TestDB_$suffix.$dbExt15") -Force
+}
+
+# --- Phase B: empty delta must not create a file ---
+ $sw.Restart()
+ $db15.SaveToDisk()
+ $sw.Stop()
+ $tx15B = Get-TxLogFiles -TxLogFolder $tx15Folder -DbFileName 'TestDB'
+if ($tx15B.Count -ne 1) { Write-Host "FAIL: empty-delta save created a new txlog file (Count=$($tx15B.Count))" -ForegroundColor Red; $tx15Ok = $false }
+Add-TestMetric -TestName "Test 15" -Operation "Empty delta skip" -Context "Saves again with no pending operations and verifies that no new txlog file is created (empty-delta early return)." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($tx15B.Count -eq 1){"OK"}else{"FAIL"})
+
+# --- Phase C: second delta - the file chain must continue above the previous range ---
+ $db15.Add('tx_D', 'vD1')
+ $db15.Remove('tx_C')
+ $db15.RemoveNestedHashTableKey('tx_N', 'sub1')
+ $sw.Restart()
+ $db15.SaveToDisk()
+ $sw.Stop()
+ $tx15C = Get-TxLogFiles -TxLogFolder $tx15Folder -DbFileName 'TestDB'
+ $phaseOk = $true
+if ($tx15C.Count -ne 2) { Write-Host "FAIL: expected 2 txlog files after save #2, got $($tx15C.Count)" -ForegroundColor Red; $phaseOk = $false }
+if ($phaseOk) {
+    $f2 = $tx15C[1]
+    if ($f2.FirstTick -le $tx15C[0].LastTick) { Write-Host "FAIL: file #2 range overlaps file #1 (firstTick $($f2.FirstTick) <= lastTick $($tx15C[0].LastTick))" -ForegroundColor Red; $phaseOk = $false }
+    $e2 = @($f2.Entries)
+    if ($e2.Count -ne 3) { Write-Host "FAIL: expected 3 entries in file #2, got $($e2.Count)" -ForegroundColor Red; $phaseOk = $false }
+    $byKey2 = @{}
+    foreach ($e in $e2) { $byKey2["$($e[1])"] = $e }
+    if ("$($byKey2['tx_D'][2])" -ne 'vD1') { Write-Host "FAIL: tx_D entry broken" -ForegroundColor Red; $phaseOk = $false }
+    if ("$($byKey2['tx_C'][0])" -ne 'R') { Write-Host "FAIL: tx_C should be a tombstone in file #2" -ForegroundColor Red; $phaseOk = $false }
+    $nVal2 = $byKey2['tx_N'][2]
+    if (-not ($nVal2 -is [System.Collections.IDictionary]) -or $nVal2['sub2'] -ne 22 -or $nVal2.ContainsKey('sub1')) { Write-Host "FAIL: tx_N post-removal snapshot broken" -ForegroundColor Red; $phaseOk = $false }
+    if ($db15.KeyToTx.Count -ne 0) { Write-Host "FAIL: KeyToTx not trimmed after save #2" -ForegroundColor Red; $phaseOk = $false }
+}
+Add-TestMetric -TestName "Test 15" -Operation "Chain continuation (save #2)" -Context "Adds a new key, removes an existing one and removes a nested secondary key, saves and verifies: the second txlog file starts above the first file's range (no overlap), contains exactly the 3 new ops (incl. the post-removal nested snapshot) and trims the map." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($phaseOk){"OK"}else{"FAIL"})
+if (-not $phaseOk) { $tx15Ok = $false }
+
+# --- Phase D: watermark round-trip on load + tick bootstrap above it ---
+ $db15d = New-TestDB -Folder $folder15 -BackupCount 0
+ $sw.Restart()
+ $null = $db15d.LoadFromDisk()
+ $sw.Stop()
+ # Capture the LOADED watermark BEFORE the save below: a successful save publishes a NEW watermark
+ # into DbStateAsOfTick, so the bootstrap assertion must compare against the loaded value
+ $W15d = $db15d.DbStateAsOfTick
+ $phaseOk = $true
+if ($db15d.DbStateAsOfTick -le 0) { Write-Host "FAIL: DbStateAsOfTick not restored from the deletes file" -ForegroundColor Red; $phaseOk = $false }
+if ($db15d.DbStateAsOfTick -ne $db15.DbStateAsOfTick) { Write-Host "FAIL: watermark mismatch after load (loaded $($db15d.DbStateAsOfTick) vs saved $($db15.DbStateAsOfTick))" -ForegroundColor Red; $phaseOk = $false }
+ # replay-safety invariant: every entry persisted at or before this save has tick <= watermark
+foreach ($f in $tx15C) {
+    foreach ($e in @($f.Entries)) {
+        if ([long]$e[3] -gt $db15d.DbStateAsOfTick) { Write-Host "FAIL: entry tick ($($e[3])) exceeds the loaded watermark ($($db15d.DbStateAsOfTick))" -ForegroundColor Red; $phaseOk = $false }
+    }
+}
+ # Also exercise the optional fsync path on this small file (durability option)
+ $db15d.TxLogFlushToDisk = $true
+ # bootstrap: an op registered after load must get a tick strictly above the loaded watermark
+ $db15d.Add('tx_E', 'vE1')
+ $db15d.SaveToDisk()
+ $tx15D = Get-TxLogFiles -TxLogFolder $tx15Folder -DbFileName 'TestDB'
+if ($tx15D.Count -ne 3) { Write-Host "FAIL: expected 3 txlog files after the post-load save, got $($tx15D.Count)" -ForegroundColor Red; $phaseOk = $false }
+if ($phaseOk) {
+    if ($tx15D[2].FirstTick -le $W15d) { Write-Host "FAIL: post-load file range not above the loaded watermark (firstTick $($tx15D[2].FirstTick) <= W $W15d)" -ForegroundColor Red; $phaseOk = $false }
+    if (@($tx15D[2].Entries).Count -ne 1 -or "$(@($tx15D[2].Entries)[0][1])" -ne 'tx_E') { Write-Host "FAIL: file #3 should contain exactly the post-load op" -ForegroundColor Red; $phaseOk = $false }
+    if ($tx15D[2].FirstTick -le $tx15C[1].LastTick) { Write-Host "FAIL: post-load file range not above the previous file (chain broken)" -ForegroundColor Red; $phaseOk = $false }
+}
+Add-TestMetric -TestName "Test 15" -Operation "Watermark round-trip + bootstrap" -Context "Loads the saved state into a fresh instance and verifies the ___DBSTATEASTOFTICK___ watermark round-trip, the invariant that every persisted txlog entry tick is <= the watermark, the optional fsync path, and that a post-load op receives a tick strictly above the watermark (TxTickGenerator bootstrap)." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($phaseOk){"OK"}else{"FAIL"})
+if (-not $phaseOk) { $tx15Ok = $false }
+
+# --- Phase E: crash-recovery replay from the save-#1 state ---
+ $db15r = New-TestDB -Folder $replayBase -BackupCount 0
+ $sw.Restart()
+ $null = $db15r.LoadFromDisk()
+ $applied = Invoke-TxLogReplay -Db $db15r -FromTick $db15r.DbStateAsOfTick -TxLogFolder $tx15Folder
+ $sw.Stop()
+ $phaseOk = $true
+if ($db15r.DbStateAsOfTick -ne $W1) { Write-Host "FAIL: replay-base watermark ($($db15r.DbStateAsOfTick)) != save-#1 watermark ($W1)" -ForegroundColor Red; $phaseOk = $false }
+if ($applied -ne 4) { Write-Host "FAIL: expected 4 replayed entries (3 from file #2 + 1 from file #3), got $applied" -ForegroundColor Red; $phaseOk = $false }
+if ($db15r.MergedHT.Count -ne $db15d.MergedHT.Count) { Write-Host "FAIL: replayed key count ($($db15r.MergedHT.Count)) != live ($($db15d.MergedHT.Count))" -ForegroundColor Red; $phaseOk = $false }
+if ("$($db15r.Get('tx_A'))" -ne 'vA2') { Write-Host "FAIL: replayed tx_A != vA2" -ForegroundColor Red; $phaseOk = $false }
+if ("$($db15r.Get('tx_D'))" -ne 'vD1') { Write-Host "FAIL: replayed tx_D != vD1" -ForegroundColor Red; $phaseOk = $false }
+if ("$($db15r.Get('tx_E'))" -ne 'vE1') { Write-Host "FAIL: replayed tx_E != vE1" -ForegroundColor Red; $phaseOk = $false }
+ $rN = $db15r.Get('tx_N')
+if (-not ($rN -is [System.Collections.IDictionary]) -or $rN['sub2'] -ne 22 -or $rN.ContainsKey('sub1')) { Write-Host "FAIL: replayed tx_N nested state wrong" -ForegroundColor Red; $phaseOk = $false }
+if ($null -ne $db15r.Get('tx_C') -or $null -ne $db15r.Get('tx_B')) { Write-Host "FAIL: tx_C/tx_B must be absent after replay" -ForegroundColor Red; $phaseOk = $false }
+ # idempotency: replaying the same logs again from the same watermark converges to the same state
+ $null = Invoke-TxLogReplay -Db $db15r -FromTick $W1 -TxLogFolder $tx15Folder
+if ($db15r.MergedHT.Count -ne $db15d.MergedHT.Count -or "$($db15r.Get('tx_A'))" -ne 'vA2') { Write-Host "FAIL: replay is not idempotent" -ForegroundColor Red; $phaseOk = $false }
+Add-TestMetric -TestName "Test 15" -Operation "Crash-recovery replay" -Context "Simulates recovery: loads the state snapshot taken after save #1 (files copied at that point), replays every txlog entry with a tick above that state's watermark (file #1 filtered out, 4 delta entries applied) and verifies convergence to the live state (values, nested hashtable, tombstoned keys absent) plus replay idempotency." -ElapsedSeconds $sw.Elapsed.TotalSeconds -Status $(if($phaseOk){"OK"}else{"FAIL"})
+if (-not $phaseOk) { $tx15Ok = $false }
+
+if ($tx15Ok) { Write-Host "PASS: TxLog correctness & replay OK" -ForegroundColor Green } else { Write-Host "FAIL: TxLog correctness & replay failed" -ForegroundColor Red; $AllOk = $false }
 
 # -------------------------------------------------
 # 3. Summary & Save Metrics

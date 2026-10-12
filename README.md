@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell" alt="PowerShell 7+">
   <img src="https://img.shields.io/badge/dependencies-none-success" alt="No dependencies">
-  <img src="https://img.shields.io/badge/tests-14%2F14%20passed-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-15%2F15%20passed-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/storage-JSON%20%2F%20CLIXML-informational" alt="JSON / CLIXML storage">
   <img src="https://img.shields.io/badge/TxLog-optional-blueviolet" alt="Transaction log">
 </p>
@@ -22,15 +22,15 @@
 
 ### Overview
 
-**HashTableDB1** is a lightweight, dependency-free, persistent key-value store written in pure PowerShell 7+. It saves data to JSON files (or classic CLIXML XML in compatibility mode), supports asynchronous flushing and loading, and preserves exact .NET types via an internal type-tagging mechanism. It also ships with an optional append-only **transaction log (TxLog)** for replica synchronisation and point-in-time recovery.
+**HashTableDB1** is a lightweight, dependency-free, persistent key-value store written in pure PowerShell 7+. It saves data to JSON files (or classic CLIXML XML in compatibility mode), supports asynchronous flushing and loading, and preserves exact .NET types via an internal type-tagging mechanism. It also ships with an optional append-only **transaction log (TxLog)** for replica synchronisation and crash recovery (last snapshot + journal tail).
 
 ### Features
 
 - **Persistent** - data survives process restarts (JSON on disk).
-- **Thread-safe** - lock-free reads over `ConcurrentDictionary`; writes use CAS retry loops, TxLog state is guarded by `[System.Threading.Monitor]`.
-- **Asynchronous I/O** - three independent background subsystems (save, load, TxLog) run inside persistent `RunspacePool(1,1)` instances and never block the caller.
+- **Thread-safe** - lock-free reads over `ConcurrentDictionary`; writes use CAS retry loops, TxLog registration is lock-free (per-key `ConcurrentDictionary`) and the TxLog flush itself is serialized by a single `Monitor`.
+- **Asynchronous I/O** - four independent background subsystems (save, load, class rehydration, TxLog) run inside persistent `RunspacePool(1,1)` instances and never block the caller.
 - **Type fidelity** - integers, longs, doubles, booleans, dates, GUIDs, arrays and nested hashtables round-trip exactly.
-- **Transaction log** - optional append-only journal of every `Add` / `Remove` with `FileTimeUtc` ticks.
+- **Transaction log** - optional append-only journal of `Add` / `Remove` deltas with monotonic ticks, values captured at operation time and atomic tmp+rename writes; replayable from the saved-state watermark for crash recovery and replica sync.
 - **Backup rotation** - timestamped `.old` backups with configurable retention.
 - **CLIXML compatibility mode** - `StorageFormat = 'Xml'` writes classic `PSSerializer` XML for legacy consumers; files of the other format are auto-migrated (archived to `OLD/`), so the folder always holds exactly one format.
 - **Zero dependencies** - pure PowerShell 7+, no modules required.
@@ -94,11 +94,11 @@ $db.Dispose()
 | `SaveToDisk()` | Synchronous save (auto-compacts when deltas exceed 30 % of main). |
 | `SaveToDiskAsync()` | Asynchronous save via background runspace. |
 | `LoadFromDisk()` | Synchronous load with legacy-XML fallback and recovery from `.tmp` / `.old`. |
-| `LoadFromDiskAsync()` | Asynchronous load; class rehydration happens on the main thread. |
+| `LoadFromDiskAsync()` | Asynchronous load; class types are resolved on the main thread, instance rehydration runs in the background. |
 | `UpsertNestedHashTableKey($Key, $SubKey, $Value)` | Atomic (CAS-retried) upsert of a secondary key inside a hashtable record. |
 | `RemoveNestedHashTableKey($Key, $SubKey)` | Removes a secondary key; removes the record when it becomes empty. |
 | `SaveTransactionLogAsync()` | Writes unsaved operation deltas to `TxLog/*.txlog` in the background. |
-| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForPendingTransactionLogOperations()` | Block until the corresponding async operation completes. |
+| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForAsyncRehydrate()` / `WaitForPendingTransactionLogOperations()` | Block until the corresponding async operation completes. |
 | `CreateEmptyDB()` | Clears all in-memory state. |
 | `EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite)` | Creates the DB folder and applies ACL for the given SID. |
 | `Dispose()` | Waits for all async work, unregisters events, disposes pools. |
@@ -114,7 +114,9 @@ $db.Dispose()
 | `DatabaseParamsHT` | `@{}` | User parameters persisted with the DB (stored inside the deletes file). |
 | `ReadOnlyMode` | `$false` | Blocks all write operations. |
 | `EnableTransactionLog` | `$false` | Enables the transaction log. |
-| `TxLogRetentionDays` | `3` | Retention window for `.txlog` files and in-memory tick state. |
+| `TxLogRetentionDays` | `3` | Retention window for `.txlog` files on disk (in-memory state is trimmed after every successful flush). |
+| `TxLogFlushToDisk` | `$false` | fsync the txlog file to physical disk before it becomes visible (recovery-critical mode; costs an I/O stall per flush). |
+| `DbStateAsOfTick` | `0` | Saved-state watermark: every op with tick ≤ this value is already reflected in the DB files (persisted as `___DBSTATEASTOFTICK___` in the deletes file, published on save, restored on load). Replay/sync must apply only txlog entries with a newer tick. |
 | `LockFileMaxWaitTime` | `30` | Max seconds to wait for a stuck async operation before force-kill. |
 | `ErrorLevel` / `ErrorText` | `0` / `$null` | Result of the last operation: `0` = success, string code = error. |
 | `MainFileLoadedDT` / `UpdatesFileLoadedDT` / `RemovedFileLoadedDT` | - | Per-file load/save timestamps; drive incremental loads (unchanged files are skipped). |
@@ -125,7 +127,7 @@ Values are stored with a type tag, so these round-trip exactly:
 
 `[int]`, `[long]`, `[double]`, `[decimal]`, `[bool]`, `[string]`, `[datetime]`, `[guid]`, `[array]`, `[hashtable]` (nested).
 
-PowerShell classes (user-defined, non-`System.*` / non-`Microsoft.*` namespaces) are serialized with a `~C` marker and rehydrated by `HashtableDB1Class_RestoreClassesScriptBlock` on load. Complex `System.*` types fall back to minified CLIXML.
+PowerShell classes (user-defined, non-`System.*` / non-`Microsoft.*` namespaces) are serialized with a `~C` marker and rehydrated on load by a native C# batch pass: `~C` nodes are collected in a single traversal, each unique class name is resolved once into a type map, and all instances are rehydrated in one pass (a PowerShell fallback covers constructors with parameters). Complex `System.*` types fall back to minified CLIXML.
 
 JSON markers used by the converter:
 
@@ -166,6 +168,8 @@ In `Xml` (CLIXML) mode these tags do not exist: primitives, `DateTime`, arrays a
        *_deletes.json           *_deletes.json
 ```
 
+*Class rehydration runs as a fourth background operation, reusing the free load pool when possible.*
+
 ## Performance
 
 Measured by the bundled suite (`code_testing/Test-Hashtable-DB1.ps1`) in fresh processes,
@@ -173,12 +177,12 @@ PowerShell 7, desktop hardware, records ≈ 1 KB:
 
 | Operation | Volume | Json (default) | Xml (compatibility mode) |
 | --- | --- | --- | --- |
-| `Add` | 120 000 records | ≈ 3.2-3.7 s | format-independent* |
-| `Get` | 50 000 lookups | ≈ 0.43 s | format-independent* |
-| Random `Get` | 10 000 of 100 000 | ≈ 0.10 s | format-independent* |
-| `SaveToDisk` | 120 000 records (~120 MB Json) | ≈ 0.21 s (~570 000 rec/s) | ≈ 2.4 s (~11× slower) |
-| `LoadFromDisk` | 120 000 records | ≈ 0.79 s (~152 000 rec/s) | ≈ 2.4 s (~3× slower) |
-| `SaveToDiskAsync` ×2 | 120 000 records | ≈ 0.29 s | ≈ 2.4 s |
+| `Add` | 120 000 records | ≈ 2.7-3.4 s | format-independent* |
+| `Get` | 50 000 lookups | ≈ 0.3 s | format-independent* |
+| Random `Get` | 10 000 of 100 000 | ≈ 0.05 s | format-independent* |
+| `SaveToDisk` | 120 000 records (~120 MB Json) | ≈ 0.17 s (~700 000 rec/s) | ≈ 2.4 s (~14× slower) |
+| `LoadFromDisk` | 120 000 records | ≈ 0.5 s (~240 000 rec/s) | ≈ 2.4 s (~5× slower) |
+| `SaveToDiskAsync` ×2 | 120 000 records | ≈ 0.25-0.3 s | ≈ 2.4 s |
 | Peak transient memory on `SaveToDisk` | 120 000 records | ≈ +80 MB | ≈ +0.9 GB |
 | `CompactDatabase` | 100 000-record base | ≈ 0.1 ms (reference swap) | same |
 
@@ -191,7 +195,7 @@ unless legacy consumers require CLIXML.
 
 ## Asynchronous operations
 
-HashTableDB1 ships **three independent async subsystems**, each backed by its own
+HashTableDB1 ships **four independent async subsystems**, each backed by a
 persistent `RunspacePool(1,1)` and a `Register-ObjectEvent`-driven completion handler.
 The caller thread **never blocks** on disk I/O - GUI scripts stay responsive while
 multi-hundred-MB databases are being flushed or loaded.
@@ -201,6 +205,7 @@ multi-hundred-MB databases are being flushed or loaded.
 | Async save | `SaveToDiskAsync()` | `WaitForAsyncSaveToDisk()` | `$AsynchronousSaveOperationState` |
 | Async load | `LoadFromDiskAsync()` | `WaitForAsyncLoadFromDisk()` | `$AsynchronousLoadOperationState` |
 | Async TxLog | `SaveTransactionLogAsync()` | `WaitForPendingTransactionLogOperations()` | `$AsynchronousTransactionLogSaveState` |
+| Async rehydrate | internal: launched by the async-load event action | `WaitForAsyncRehydrate()` | `$AsynchronousRehydrateOperationState` (reuses the free load pool when possible) |
 
 ### Typical async workflow
 
@@ -231,10 +236,12 @@ $db.SaveToDiskAsync()
 - **Atomic state swap** - `MergedHT` is replaced **last**, so concurrent readers keep serving
   the old consistent view until the very end of the swap. Assignment order:
   `MainHT` → `UpdatesHT` → `RemovedHT` → `MergedHT`.
-- **Lightweight rehydration on the main thread** - `LoadFromDiskAsync` collects
-  `~C` marker nodes in the background (Phase 3), then the event action rehydrates them
-  in reverse DFS order so nested instances exist before their containers copy them out
-  of raw hashtables. If no `~C` markers were seen, the traversal is skipped entirely.
+- **Background class rehydration** - `LoadFromDiskAsync` collects `~C` marker nodes in the
+  background (Phase 3); the event action resolves each unique class name once on the main
+  thread (user classes exist only in that session) and immediately launches a fourth
+  background operation that rehydrates all instances in a single native pass - the main
+  thread never freezes on large class-heavy datasets. If no `~C` markers were seen, the
+  traversal is skipped entirely.
 - **Bounded waits** - every `WaitFor*` uses `LockFileMaxWaitTime` (default **30 s**);
   on timeout the runspace is force-killed and the pool re-created on next use.
 - **Self-healing** - bad `PSEventJob` states (`Failed`, `Blocked`) are detected and cleaned
@@ -261,15 +268,17 @@ is re-created on the next operation.
 
 ## Transaction log (TxLog)
 
-The TxLog is an **opt-in append-only journal** that records every `Add` / `Remove`
-with a monotonically increasing `FileTimeUtc` tick. It is designed for
-**replica synchronisation** and **point-in-time recovery**.
+The TxLog is an **opt-in append-only journal** that records the last operation per key
+(`Add` / `Remove` / nested upserts) with a monotonically increasing tick and the value
+captured at operation time. It is designed for **replica synchronisation** and
+**crash recovery** (last snapshot + journal tail).
 
 Enable it once on the writer side:
 
 ```powershell
 $db.EnableTransactionLog   = $true
 $db.TxLogRetentionDays     = 7      # auto-delete files older than 7 days
+# $db.TxLogFlushToDisk     = $true  # optional: fsync each txlog file (recovery-critical mode)
 $db.DatabaseFolderPath     = "$PWD"
 ```
 
@@ -291,32 +300,57 @@ Content is a compact JSON array of `[op, key, value, tick]` tuples:
 ```
 
 - `op` - `"A"` (add/update) or `"R"` (remove)
-- `value` - actual value for `"A"`, `null` for `"R"`
-- `tick` - `DateTime.UtcNow.ToFileTimeUtc()`
+- `value` - the value captured at operation registration time for `"A"`, `null` for `"R"` (exact replay record, never re-read from the merged view)
+- `tick` - monotonic tick issued by the internal `TxTickGenerator` (wall-clock based, CAS-clamped above every previously issued tick - immune to backward clock jumps)
 
-The writer also maintains two in-memory indexes:
+Files are written atomically: data goes to `<name>.txlog.tmp` and is renamed only after
+a successful serialization, so a crash can never leave a torn `.txlog` - file ranges stay
+strictly increasing and non-overlapping.
+
+The writer also maintains the in-memory state:
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `KeyToTick` | `ConcurrentDictionary[string, long]` | Last tick per key, for retention pruning. |
-| `TickToKeys` | `SortedDictionary[long, List<Tuple<string,string>>]` | Chronological order of `(key, op)` entries. |
+| `KeyToTx` | `ConcurrentDictionary[string, object]` | Last `(tick, op, value)` record per key, captured at op time. Lock-free; doubles as last-writer-wins bookkeeping for sync. Bounded by distinct keys, trimmed after every successful flush. |
+| `TxTickGenerator` | C# class (hidden) | Monotonic tick source (CAS-clamped wall clock). On load it is bootstrapped above the saved-state watermark, so a replica with a lagging clock never issues ticks below the state it just loaded. |
+| `TxLogSaveLock` | `object` (hidden) | Serializes sync + async invocations of the TxLog flush scriptblock. |
+| `LastTransactionLogSavedTimestamp` | `long` | High-water mark: only entries with a newer tick are written on the next flush. |
+| `LastTxLogTick` | `long` | Last tick persisted to a txlog file. |
 
-`TickToKeys` is guarded by `TickToKeysLock` (`[System.Threading.Monitor]`) because
-`SortedDictionary` is not thread-safe. `KeyToTick` is a `ConcurrentDictionary` and
-needs no external lock.
+### Saved-state watermark (replay position)
+
+Every save writes `___DBSTATEASTOFTICK___` into the deletes file: all operations with
+`tick <= DbStateAsOfTick` are already reflected in the saved `main` / `updates` / `deletes`
+files. The property is published on save and restored on load. **Replay/sync must apply
+only txlog entries with a newer tick** - this makes recovery deterministic:
+
+1. Load the database files (the watermark comes with them).
+2. Read `TxLog/*.txlog` in ascending `firstTick` order (file names carry the ranges).
+3. Skip whole files whose `lastTick <= DbStateAsOfTick`; apply per-entry `tick > watermark`
+   as `"A" -> Add(key, value)` / `"R" -> Remove(key)` (idempotent, last-writer-wins by tick).
+
+A reference implementation of this algorithm is the `Invoke-TxLogReplay` helper in the
+test suite (Test 15). When applying a *remote* replica's log, do not route entries through
+`Add`/`Remove` of your own writer instance - that would re-register the ops in your TxLog
+and echo them back; write to the dictionaries directly instead.
 
 ### Retention & cleanup
 
-`SaveTxLogScriptBlock` performs **three cleanup passes** on every flush:
+`SaveTxLogScriptBlock` cleans up on every successful flush:
 
-1. `KeyToTick` - drop keys whose last tick is older than the retention window.
-2. `TickToKeys` - drop tick buckets older than the window (under `TickToKeysLock`).
-3. On-disk `.txlog` files - regex-matched by name and deleted if
+1. **In-memory trim** - every `KeyToTx` record with `tick <= lastTick of the flushed file`
+   is removed, so memory holds only the *unsaved* delta, not a retention window of
+   history. Safe by construction: new ticks are issued strictly above the generator
+   watermark, so a concurrently registered op can never be trimmed.
+2. **Orphan `.tmp` GC** - crash-leftover `<name>_*_*.txlog.tmp` files older than 1 hour
+   are deleted (the age guard covers a foreign in-flight writer).
+3. **On-disk retention** - `.txlog` files regex-matched by name and deleted if
    `GetLastWriteTime < cutoff` (3 retry attempts on `IOException`).
 
-`LastTransactionLogSavedTimestamp` tracks the high-water mark so only **new** deltas
-are written on the next flush. `LastTxLogTick` is retained for external API
-compatibility.
+`LastTransactionLogSavedTimestamp` (the high-water mark) and `LastTxLogTick` advance
+only after a successful commit; on any failure the pending delta stays in memory and
+the next flush rewrites the same tick range under the same file name (idempotent
+overwrite).
 
 ### Why a TxLog is worth it
 
@@ -333,12 +367,19 @@ policy keeps disk usage bounded without operator intervention.
 
 ### TxLog performance notes
 
-- Entries are stored as `[System.Tuple]::Create($key, $op)` - direct .NET allocation
-  without `PSObject` wrapping, significantly faster than hashtable literals on bulk deltas.
-- `KeyToTick` is a `ConcurrentDictionary`; `TickToKeys` is a `SortedDictionary`
-  guarded by a single `Monitor` lock - one lock acquisition per batch, not per key.
+- Registration is **lock-free**: one closed-generic `Tuple(tick, op, value)` allocation and
+  one `ConcurrentDictionary` overwrite per operation (~1 µs), no `PSObject` wrapping and
+  no locks on the write hot path.
+- Delta collection is a single native C# pass over `KeyToTx` (filter by cutoff, build the
+  entry list, track min/max ticks for the file name) - no PowerShell loops and no
+  snapshot copy under a lock.
+- Memory is bounded by *distinct changed keys since the last flush* (trimmed after every
+  successful write), not by the retention window.
 - The TxLog writer runs in its own `RunspacePool(1,1)`; a save of the main DB and a
-  TxLog flush can run **concurrently**.
+  TxLog flush can run **concurrently**. Sync and async flushes are mutually excluded by
+  `TxLogSaveLock`.
+- The bundled test suite runs with TxLog enabled, so the in-memory timings in the
+  performance table already include the registration overhead.
 
 ---
 
@@ -400,6 +441,8 @@ Legacy `.xml` files from earlier versions are transparently handled, and the
 | `STXASNC1` | Async save `EndInvoke` threw. |
 | `TXLOG2` | Async TxLog `EndInvoke` threw. |
 | `TXLOG3` | Failed to start async TxLog save. |
+| `RHYD1` | Failed to start async class rehydration. |
+| `RHYD2` | Async class rehydration `EndInvoke` threw. |
 | `ALOAD1` | Failed to start async load. |
 | `ALOAD2` | Async load `EndInvoke` returned no output. |
 | `EDBFP1` | Failed to ensure DB folder with permissions. |
@@ -412,8 +455,9 @@ pwsh -NoProfile -File ./code_testing/Test-Hashtable-DB1.ps1
 ```
 
 The `$StorageFormatToTest` variable at the top of the script selects the storage format for
-save/load tests (`'json'` or `'xml'`). Expected: **14 / 14 passed** in Json mode; in Xml mode
-Test 14 (JSON type-fidelity markers) is skipped by design.
+save/load tests (`'json'` or `'xml'`). Expected: **15 / 15 passed** in Json mode; in Xml mode
+Test 14 (JSON type-fidelity markers) is skipped by design, while Test 15 (TxLog correctness,
+watermark and crash-recovery replay) is format-independent and always runs.
 
 ### License
 
@@ -431,15 +475,15 @@ MIT - see [LICENSE](LICENSE).
 поддерживается асинхронная запись и загрузка, а также точное сохранение .NET-типов
 через внутреннюю систему тегов. Дополнительно реализован опциональный
 append-only **транзакционный лог (TxLog)** для синхронизации реплик и
-восстановления на момент времени.
+восстановления после сбоев (последний снимок + хвост журнала).
 
 ### Возможности
 
 - **Персистентность** - данные переживают перезапуск процесса (JSON на диске).
-- **Потокобезопасность** - чтение без блокировок поверх `ConcurrentDictionary`; записи через CAS-повторы, состояние TxLog защищено `[System.Threading.Monitor]`.
-- **Асинхронный ввод-вывод** - три независимые фоновые подсистемы (save, load, TxLog) работают в постоянных `RunspacePool(1,1)` и не блокируют вызывающий поток.
+- **Потокобезопасность** - чтение без блокировок поверх `ConcurrentDictionary`; записи через CAS-повторы, регистрация TxLog lock-free (per-key `ConcurrentDictionary`), сам сброс TxLog сериализуется одним `Monitor`.
+- **Асинхронный ввод-вывод** - четыре независимые фоновые подсистемы (save, load, реанимация классов, TxLog) работают в постоянных `RunspacePool(1,1)` и не блокируют вызывающий поток.
 - **Точность типов** - целые, длинные, дробные, логические, даты, GUID, массивы и вложенные хеш-таблицы восстанавливаются без потерь.
-- **Транзакционный лог** - опциональный append-only журнал всех `Add` / `Remove` с тиками `FileTimeUtc`.
+- **Транзакционный лог** - опциональный append-only журнал дельт `Add` / `Remove` с монотонными тиками, захватом значений в момент операции и атомарной записью tmp+rename; воспроизводим от watermark'а сохранённого состояния для восстановления и синхронизации.
 - **Ротация бэкапов** - временные метки `.old` с настраиваемым хранением.
 - **Режим совместимости CLIXML** - `StorageFormat = 'Xml'` пишет классический XML `PSSerializer` для легаси-потребителей; файлы другого формата мигрируют автоматически (уходят в `OLD/`), поэтому в папке всегда ровно один формат.
 - **Ноль зависимостей** - только PowerShell 7+.
@@ -503,11 +547,11 @@ $db.Dispose()
 | `SaveToDisk()` | Синхронное сохранение (авто-компакт при дельтах > 30 % от main). |
 | `SaveToDiskAsync()` | Асинхронное сохранение через фоновый runspace. |
 | `LoadFromDisk()` | Синхронная загрузка с fallback на legacy-XML и восстановлением из `.tmp` / `.old`. |
-| `LoadFromDiskAsync()` | Асинхронная загрузка; рехидратация классов - в основном потоке. |
+| `LoadFromDiskAsync()` | Асинхронная загрузка; типы классов резолвятся в основном потоке, реанимация экземпляров идёт в фоне. |
 | `UpsertNestedHashTableKey($Key, $SubKey, $Value)` | Атомарный (CAS-повторы) upsert вторичного ключа внутри записи-хеш-таблицы. |
 | `RemoveNestedHashTableKey($Key, $SubKey)` | Удаляет вторичный ключ; удаляет запись, когда она опустела. |
 | `SaveTransactionLogAsync()` | Фоновая запись несохранённых дельт операций в `TxLog/*.txlog`. |
-| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForPendingTransactionLogOperations()` | Блокируются до завершения соответствующей async-операции. |
+| `WaitForAsyncSaveToDisk()` / `WaitForAsyncLoadFromDisk()` / `WaitForAsyncRehydrate()` / `WaitForPendingTransactionLogOperations()` | Блокируются до завершения соответствующей async-операции. |
 | `CreateEmptyDB()` | Очищает всё in-memory состояние. |
 | `EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite)` | Создаёт папку БД и назначает ACL для указанного SID. |
 | `Dispose()` | Ждёт все async-операции, снимает события, dispose пулов. |
@@ -523,7 +567,9 @@ $db.Dispose()
 | `DatabaseParamsHT` | `@{}` | Пользовательские параметры, хранимые вместе с БД (внутри deletes-файла). |
 | `ReadOnlyMode` | `$false` | Блокирует все операции записи. |
 | `EnableTransactionLog` | `$false` | Включает транзакционный лог. |
-| `TxLogRetentionDays` | `3` | Окно хранения `.txlog`-файлов и тиков в памяти. |
+| `TxLogRetentionDays` | `3` | Окно хранения `.txlog`-файлов на диске (in-memory состояние обрезается после каждого успешного сброса). |
+| `TxLogFlushToDisk` | `$false` | Принудительный fsync txlog-файла на физический диск перед его появлением - режим, критичный к восстановлению; стоит I/O-паузы на каждый сброс. |
+| `DbStateAsOfTick` | `0` | Watermark сохранённого состояния: все операции с тиком ≤ значения уже отражены в файлах БД (пишется как `___DBSTATEASTOFTICK___` в deletes-файл, публикуется при save, восстанавливается при load). Replay/sync должны применять только записи txlog с более новым тиком. |
 | `LockFileMaxWaitTime` | `30` | Максимум секунд ожидания зависшей async-операции до принудительного завершения. |
 | `ErrorLevel` / `ErrorText` | `0` / `$null` | Результат последней операции: `0` = успех, строковый код = ошибка. |
 | `MainFileLoadedDT` / `UpdatesFileLoadedDT` / `RemovedFileLoadedDT` | - | Таймстампы загрузки/сохранения по файлам; движок инкрементальных загрузок. |
@@ -535,8 +581,10 @@ $db.Dispose()
 `[int]`, `[long]`, `[double]`, `[decimal]`, `[bool]`, `[string]`, `[datetime]`, `[guid]`, `[array]`, `[hashtable]` (вложенные).
 
 Пользовательские классы PowerShell (не из `System.*` / `Microsoft.*`) сериализуются
-с маркером `~C` и восстанавливаются через `HashtableDB1Class_RestoreClassesScriptBlock`.
-Сложные `System.*`-типы падают в minified CLIXML.
+с маркером `~C` и восстанавливаются при загрузке нативным C#-проходом: узлы `~C`
+собираются одним обходом, каждое уникальное имя класса резолвится один раз в карту
+типов, и все экземпляры реанимируются за один проход (PowerShell-fallback покрывает
+конструкторы с параметрами). Сложные `System.*`-типы падают в minified CLIXML.
 
 Маркеры JSON, используемые конвертером:
 
@@ -579,6 +627,8 @@ $db.Dispose()
        *_deletes.json           *_deletes.json
 ```
 
+*Реанимация классов идёт четвёртой фоновой операцией, переиспользуя освободившийся load-пул.*
+
 ## Производительность
 
 Замерено комплектом тестов (`code_testing/Test-Hashtable-DB1.ps1`) в свежих процессах,
@@ -586,12 +636,12 @@ PowerShell 7, настольное железо, записи ≈ 1 КБ:
 
 | Операция | Объём | Json (по умолчанию) | Xml (режим совместимости) |
 | --- | --- | --- | --- |
-| `Add` | 120 000 записей | ≈ 3.2-3.7 с | не зависит от формата* |
-| `Get` | 50 000 чтений | ≈ 0.43 с | не зависит от формата* |
-| Случайный `Get` | 10 000 из 100 000 | ≈ 0.10 с | не зависит от формата* |
-| `SaveToDisk` | 120 000 записей (~120 МБ Json) | ≈ 0.21 с (~570 000 зап/с) | ≈ 2.4 с (≈ в 11 раз медленнее) |
-| `LoadFromDisk` | 120 000 записей | ≈ 0.79 с (~152 000 зап/с) | ≈ 2.4 с (≈ в 3 раза медленнее) |
-| `SaveToDiskAsync` ×2 | 120 000 записей | ≈ 0.29 с | ≈ 2.4 с |
+| `Add` | 120 000 записей | ≈ 2.7-3.4 с | не зависит от формата* |
+| `Get` | 50 000 чтений | ≈ 0.3 с | не зависит от формата* |
+| Случайный `Get` | 10 000 из 100 000 | ≈ 0.05 с | не зависит от формата* |
+| `SaveToDisk` | 120 000 записей (~120 МБ Json) | ≈ 0.17 с (~700 000 зап/с) | ≈ 2.4 с (≈ в 14 раз медленнее) |
+| `LoadFromDisk` | 120 000 записей | ≈ 0.5 с (~240 000 зап/с) | ≈ 2.4 с (≈ в 5 раз медленнее) |
+| `SaveToDiskAsync` ×2 | 120 000 записей | ≈ 0.25-0.3 с | ≈ 2.4 с |
 | Пиковая транзиентная память при `SaveToDisk` | 120 000 записей | ≈ +80 МБ | ≈ +0.9 ГБ |
 | `CompactDatabase` | база 100 000 записей | ≈ 0.1 мс (обмен ссылок) | так же |
 
@@ -604,8 +654,8 @@ PowerShell 7, настольное железо, записи ≈ 1 КБ:
 
 ## Асинхронные операции
 
-HashTableDB1 содержит **три независимые асинхронные подсистемы**, каждая со своим
-постоянным `RunspacePool(1,1)` и обработчиком завершения через `Register-ObjectEvent`.
+HashTableDB1 содержит **четыре независимые асинхронные подсистемы**, каждая на
+постоянном `RunspacePool(1,1)` с обработчиком завершения через `Register-ObjectEvent`.
 Вызывающий поток **никогда не блокируется** на дисковом вводе-выводе - GUI-скрипт
 остаётся отзывчивым, пока многогигабайтная база сбрасывается на диск или загружается.
 
@@ -614,6 +664,7 @@ HashTableDB1 содержит **три независимые асинхронн
 | Асинхронное сохранение | `SaveToDiskAsync()` | `WaitForAsyncSaveToDisk()` | `$AsynchronousSaveOperationState` |
 | Асинхронная загрузка | `LoadFromDiskAsync()` | `WaitForAsyncLoadFromDisk()` | `$AsynchronousLoadOperationState` |
 | Асинхронный TxLog | `SaveTransactionLogAsync()` | `WaitForPendingTransactionLogOperations()` | `$AsynchronousTransactionLogSaveState` |
+| Асинхронная реанимация классов | внутренняя: запускается обработчиком события async-load | `WaitForAsyncRehydrate()` | `$AsynchronousRehydrateOperationState` (переиспользует освободившийся load-пул) |
 
 ### Типичный асинхронный сценарий
 
@@ -644,11 +695,12 @@ $db.SaveToDiskAsync()
 - **Атомарная подмена состояния** - `MergedHT` заменяется **последним**, поэтому
   конкурентные читатели видят старый консистентный снимок до самого конца подмены.
   Порядок присваивания: `MainHT` → `UpdatesHT` → `RemovedHT` → `MergedHT`.
-- **Лёгкая рехидратация в основном потоке** - `LoadFromDiskAsync` собирает узлы
-  с маркером `~C` в фоне (фаза 3), а затем обработчик события восстанавливает их
-  в обратном DFS-порядке, чтобы вложенные экземпляры существовали раньше, чем их
-  контейнеры скопируют их из сырых хеш-таблиц. Если маркеров `~C` не было,
-  обход полностью пропускается.
+- **Реанимация классов в фоне** - `LoadFromDiskAsync` собирает узлы с маркером `~C`
+  в фоне (фаза 3); обработчик события резолвит каждое уникальное имя класса один раз
+  в основном потоке (пользовательские классы существуют только в этой сессии) и сразу
+  запускает четвёртую фоновую операцию, которая реанимирует все экземпляры одним
+  нативным проходом - основной поток не замирает даже на больших данных с классами.
+  Если маркеров `~C` не было, обход полностью пропускается.
 - **Ограниченные ожидания** - каждый `WaitFor*` использует `LockFileMaxWaitTime`
   (по умолчанию **30 с**); по таймауту runspace принудительно убивается, а пул
   пересоздаётся при следующем вызове.
@@ -677,15 +729,17 @@ finally { [HashTableDB1]::CleanupAsync([ref]$thisObj.AsynchronousSaveOperationSt
 
 ## Транзакционный лог (TxLog)
 
-TxLog - это **опциональный append-only журнал**, фиксирующий каждую операцию
-`Add` / `Remove` с монотонно возрастающим тиком `FileTimeUtc`. Предназначен для
-**синхронизации реплик** и **восстановления на момент времени**.
+TxLog - это **опциональный append-only журнал**, фиксирующий последнюю операцию
+по каждому ключу (`Add` / `Remove` / вложенные upsert'ы) с монотонно возрастающим
+тиком и значением, захваченным в момент операции. Предназначен для
+**синхронизации реплик** и **восстановления после сбоев** (последний снимок + хвост журнала).
 
 Включается один раз на стороне писателя:
 
 ```powershell
 $db.EnableTransactionLog   = $true
 $db.TxLogRetentionDays     = 7      # автоудаление файлов старше 7 дней
+# $db.TxLogFlushToDisk     = $true  # опционально: fsync каждого txlog-файла (критично для восстановления)
 $db.DatabaseFolderPath     = "$PWD"
 ```
 
@@ -707,32 +761,60 @@ $db.DatabaseFolderPath     = "$PWD"
 ```
 
 - `op` - `"A"` (add/update) или `"R"` (remove)
-- `value` - фактическое значение для `"A"`, `null` для `"R"`
-- `tick` - `DateTime.UtcNow.ToFileTimeUtc()`
+- `value` - значение, захваченное в момент регистрации операции, для `"A"`; `null` для `"R"` (точная replay-запись, никогда не перечитывается из merged-представления)
+- `tick` - монотонный тик внутреннего `TxTickGenerator` (на основе wall-clock, CAS-зажат поверх всех ранее выданных тиков - неуязвим к прыжкам часов назад)
 
-Писатель также поддерживает два in-memory индекса:
+Файлы пишутся атомарно: данные уходят в `<имя>.txlog.tmp` и переименовываются только
+после успешной сериализации, поэтому краш не может оставить битый `.txlog` - диапазоны
+файлов строго возрастают и не пересекаются.
+
+Писатель также поддерживает in-memory состояние:
 
 | Поле | Тип | Назначение |
 | --- | --- | --- |
-| `KeyToTick` | `ConcurrentDictionary[string, long]` | Последний тик по ключу - для обрезки по retention. |
-| `TickToKeys` | `SortedDictionary[long, List<Tuple<string,string>>]` | Хронологический порядок записей `(key, op)`. |
+| `KeyToTx` | `ConcurrentDictionary[string, object]` | Последняя запись `(tick, op, value)` по ключу, захваченная в момент операции. Lock-free; одновременно служит учётом last-writer-wins для синхронизации. Ограничена числом различных ключей, обрезается после каждого успешного сброса. |
+| `TxTickGenerator` | C#-класс (hidden) | Монотонный источник тиков (CAS-зажатый wall-clock). При загрузке поднимается выше watermark'а сохранённого состояния, чтобы реплика с отстающими часами не выдавала тики ниже только что загруженного состояния. |
+| `TxLogSaveLock` | `object` (hidden) | Сериализует sync- и async-запуски scriptblock'а сброса TxLog. |
+| `LastTransactionLogSavedTimestamp` | `long` | High-water mark: при следующем сбросе пишутся только записи с более новым тиком. |
+| `LastTxLogTick` | `long` | Последний тик, записанный в txlog-файл. |
 
-`TickToKeys` защищён `TickToKeysLock` (`[System.Threading.Monitor]`), потому что
-`SortedDictionary` не потокобезопасен. `KeyToTick` - `ConcurrentDictionary`,
-внешняя блокировка не нужна.
+### Watermark сохранённого состояния (позиция replay)
+
+Каждое сохранение пишет `___DBSTATEASTOFTICK___` в deletes-файл: все операции с
+`tick <= DbStateAsOfTick` уже отражены в сохранённых файлах `main` / `updates` /
+`deletes`. Свойство публикуется при save и восстанавливается при load.
+**Replay/sync должны применять только записи txlog с более новым тиком** - это делает
+восстановление детерминированным:
+
+1. Загрузить файлы БД (watermark приходит вместе с ними).
+2. Читать `TxLog/*.txlog` по возрастанию `firstTick` (диапазоны - в именах файлов).
+3. Целиком пропускать файлы с `lastTick <= DbStateAsOfTick`; применять по-записно
+   `tick > watermark` как `"A" -> Add(key, value)` / `"R" -> Remove(key)`
+   (идемпотентно, last-writer-wins по тику).
+
+Референсная реализация алгоритма - хелпер `Invoke-TxLogReplay` в тестовом наборе
+(тест 15). При применении **чужого** журнала реплики не прогоняйте записи через
+`Add`/`Remove` своего экземпляра-писателя - это перерегистрирует операции в вашем
+TxLog и создаст эхо; пишите в словари напрямую.
 
 ### Хранение и очистка
 
-`SaveTxLogScriptBlock` выполняет **три прохода очистки** при каждом сбросе:
+`SaveTxLogScriptBlock` чистит при каждом успешном сбросе:
 
-1. `KeyToTick` - удаляются ключи, последний тик которых старше окна хранения.
-2. `TickToKeys` - удаляются бакеты тиков старше окна (под `TickToKeysLock`).
-3. Файлы `.txlog` на диске - сопоставляются регуляркой и удаляются, если
-   `GetLastWriteTime < cutoff` (3 попытки при `IOException`).
+1. **Обрезка in-memory** - удаляются все записи `KeyToTx` с `tick <= lastTick`
+   записанного файла, поэтому память держит только *несохранённую* дельту,
+   а не окно retention всей истории. Безопасно по построению: новые тики выдаются
+   строго выше watermark'а генератора, поэтому конкурентно зарегистрированная
+   операция не может быть обрезана.
+2. **GC осиротевших `.tmp`** - оставшиеся после крашей `<имя>_*_*.txlog.tmp` старше
+   1 часа удаляются (возраст учитывает чужого параллельного писателя).
+3. **Retention на диске** - файлы `.txlog`, сопоставленные регуляркой по имени,
+   удаляются, если `GetLastWriteTime < cutoff` (3 попытки при `IOException`).
 
-`LastTransactionLogSavedTimestamp` хранит high-water mark, поэтому при следующем
-сбросе пишутся только **новые** дельты. `LastTxLogTick` сохранён для совместимости
-с внешним API.
+`LastTransactionLogSavedTimestamp` (high-water mark) и `LastTxLogTick` продвигаются
+только после успешного коммита; при любой ошибке дельта остаётся в памяти, и следующий
+сброс перезапишет тот же диапазон тиков под тем же именем файла (идемпотентная
+перезапись).
 
 ### Чем полезен TxLog
 
@@ -749,13 +831,18 @@ $db.DatabaseFolderPath     = "$PWD"
 
 ### Производительность TxLog
 
-- Записи хранятся как `[System.Tuple]::Create($key, $op)` - прямая аллокация .NET
-  без обёртки `PSObject`, что значительно быстрее хеш-табличных литералов на
-  массовых дельтах.
-- `KeyToTick` - `ConcurrentDictionary`; `TickToKeys` - `SortedDictionary` под
-  одним `Monitor`-локом: одно взятие блокировки на пачку, а не на ключ.
+- Регистрация **lock-free**: одна аллокация закрытого generic `Tuple(tick, op, value)`
+  и одна перезапись `ConcurrentDictionary` на операцию (~1 мкс), без обёртки
+  `PSObject` и без блокировок на hot-path записи.
+- Сбор дельты - один нативный C#-проход по `KeyToTx` (фильтр по cutoff, сборка списка
+  записей, min/max тики для имени файла) - без PowerShell-циклов и без копии под локом.
+- Память ограничена *числом изменённых ключей с последнего сброса* (обрезка после
+  каждой успешной записи), а не окном retention.
 - Писатель TxLog работает в отдельном `RunspacePool(1,1)`, поэтому сохранение
-  основной БД и сброс TxLog могут идти **параллельно**.
+  основной БД и сброс TxLog могут идти **параллельно**. Sync- и async-сбросы
+  взаимно исключаются `TxLogSaveLock`.
+- Тестовый набор выполняется с включённым TxLog, поэтому тайминги in-memory
+  в таблице производительности уже включают накладные регистрации.
 
 ---
 
@@ -817,6 +904,8 @@ Legacy `.xml` из старых версий обрабатываются про
 | `STXASNC1` | `EndInvoke` асинхронного сохранения бросил исключение. |
 | `TXLOG2` | `EndInvoke` асинхронного TxLog бросил исключение. |
 | `TXLOG3` | Не удалось запустить асинхронный сброс TxLog. |
+| `RHYD1` | Не удалось запустить асинхронную реанимацию классов. |
+| `RHYD2` | `EndInvoke` асинхронной реанимации классов бросил исключение. |
 | `ALOAD1` | Не удалось запустить асинхронную загрузку. |
 | `ALOAD2` | `EndInvoke` асинхронной загрузки вернул пустой вывод. |
 | `EDBFP1` | Не удалось обеспечить папку БД с правами. |
@@ -829,8 +918,10 @@ pwsh -NoProfile -File ./code_testing/Test-Hashtable-DB1.ps1
 ```
 
 Переменная `$StorageFormatToTest` в начале скрипта задаёт формат для тестов
-сохранения/загрузки (`'json'` или `'xml'`). Ожидается: **14 / 14 passed** в режиме Json;
-в режиме Xml тест 14 (маркеры точности типов JSON) пропускается по замыслу.
+сохранения/загрузки (`'json'` или `'xml'`). Ожидается: **15 / 15 passed** в режиме Json;
+в режиме Xml тест 14 (маркеры точности типов JSON) пропускается по замыслу, а тест 15
+(корректность TxLog, watermark и replay-восстановление) форматонезависим и выполняется
+всегда.
 
 ### Лицензия
 
