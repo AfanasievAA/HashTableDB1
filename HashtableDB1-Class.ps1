@@ -6,9 +6,9 @@ HashTableDB1 is a high-performance, thread-safe, persistent key-value database f
 High-performance, thread-safe, persistent key-value store for PowerShell. Uses ConcurrentDictionary for in-memory state with automatic JSON persistence (legacy XML supported). Maintains MainHT, UpdatesHT, RemovedHT; MergedHT provides unified read view. NEVER modify internal dictionaries directly-use class methods only. Method names may reference "XML" for historical reasons; default storage is JSON.
 
 .NOTES
-  Version:        1.32
+  Version:        1.33
   Author:         Andrew Afanasiev
-  Date:           12 Oct 2026
+  Date:           26 Oct 2026
   Contact:        AfanasievAA@yandex.ru
   WARNING: Do not apply AI-generated "optimizations" without thorough testing. This is a production-critical database engine. Incorrect changes can cause data loss.
   Before committing changes: run all 3 test scripts in the code_testing\ folder. All tests must pass with zero errors.
@@ -186,9 +186,7 @@ M.CleanupAsync(ref,static): stop dispose async job
 # Registering C# converter for System.Text.Json to handle PowerShell objects natively and fast
  $psConverterType = 'PSObjectJsonConverter' -as [type]
 if ($psConverterType -and -not $psConverterType.GetMethod('BuildConcurrentDictionary', [System.Reflection.BindingFlags]'Public, Static')) {
-    # Add-Type cannot hot-reload a compiled type: if an older PSObjectJsonConverter is already loaded in
-    # this process, the guard below silently skips compilation while the PowerShell code keeps calling
-    # methods the old type lacks - every load then fails with a hidden MethodNotFound (LFX8, empty DB).
+    # Add-Type cannot hot-reload a compiled type: an older loaded converter skips compilation silently, then every load fails with a hidden MethodNotFound (LFX8, empty DB).
     throw "PSObjectJsonConverter is already loaded from an outdated version (missing static BuildConcurrentDictionary). Close and reopen the PowerShell session, then run again."
 }
 if (-not $psConverterType) {
@@ -207,15 +205,13 @@ using System.Reflection;
 /// Custom JSON converter for System.Text.Json optimized for PowerShell objects. Natively handles PSObject, Hashtable, ArrayList, and falls back to CLIXML for complex types.
 /// </summary>
 public class PSObjectJsonConverter : JsonConverter<object> {
-    // Regex to minify CLIXML output by removing whitespace between XML tags, reducing JSON size
     private static readonly System.Text.RegularExpressions.Regex _xmlMinifyRegex = 
         new System.Text.RegularExpressions.Regex(@">\s+<", System.Text.RegularExpressions.RegexOptions.Compiled);
 
-    // Cache for type categorization to avoid expensive reflection on every Write call. 0=unknown, 1=non-generic dict (e.g. Hashtable), 2=generic dict, 3=non-generic list (e.g. ArrayList), 4=generic list
+    // Cached type kind (avoids reflection per Write): 1=non-generic dict, 2=generic dict, 3=non-generic list, 4=generic list
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, int> _typeKindCache = 
         new System.Collections.Concurrent.ConcurrentDictionary<Type, int>();
 
-    // Determines the dictionary/list kind of a type using cached reflection
     private static int GetTypeKind(Type t) {
         return _typeKindCache.GetOrAdd(t, tp => {
             if (typeof(IDictionary).IsAssignableFrom(tp)) return 1;
@@ -230,48 +226,24 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         });
     }
 
-    // Max recursion depth to prevent StackOverflowException on circular object references.
-    // Cycles (e.g. LinkedList<->LinkedListNode in RollingSet.nodeDict) are cut off here and written
-    // as the "__MAX_DEPTH_REACHED__" string marker, keeping the save alive instead of failing.
+    // Depth cap for circular references; cut off cycles are written as the "__MAX_DEPTH_REACHED__" marker instead of a StackOverflowException.
     private const int MaxDepth = 100;
-    // The underlying Utf8JsonWriter has its OWN default MaxDepth of 64. Deep-but-finite graphs
-    // (migrated CLIXML Deserialized.* wrapper chains) can legitimately exceed 64 before the
-    // converter-level guard fires, so the writer limit must be raised above MaxDepth to make the
-    // converter guard the single effective depth control.
+    // Utf8JsonWriter's own default MaxDepth is 64; must exceed MaxDepth so deep CLIXML wrapper chains never trip the writer before the converter guard fires.
     private const int WriterMaxDepth = 128;
-    // Thread-static depth tracker to avoid thread contention and locks during serialization
     [ThreadStatic] private static int _currentDepth;
-    // Active-serialization stack (per converter instance): reference-identity set of containers
-    // currently being serialized. A revisit means a circular reference (e.g. LinkedList <->
-    // LinkedListNode inside RollingSet.nodeDict) - writing the "__CYCLE__" marker instead of
-    // expanding keeps serialization linear; a depth cap alone cannot bound a cyclic graph
-    // (branching references unroll exponentially and exhaust memory before any cap fires).
+    // Reference-identity set of containers currently being serialized; a revisit = circular reference, written as "__CYCLE__" (a depth cap alone cannot bound a cyclic graph).
     private readonly HashSet<object> _activeObjects = new HashSet<object>(ReferenceEqualityComparer.Instance);
-    // Circuit breaker: total container nodes serialized by this converter instance. Pathological
-    // graphs (cyclic through untracked paths, or heavily shared DAG references) expand
-    // exponentially; the budget converts an OutOfMemoryException into a clean, diagnosable error.
+    // Node budget: converts pathological graph expansion (OOM) into a clean JsonException.
     private const long MaxSerializedNodes = 20000000;
     private long _serializedNodes = 0;
-    // Thread-static flag set by Read when a '~C' class marker is encountered. Lets PowerShell skip the
-    // expensive full-tree RestoreClasses traversal for data guaranteed to contain no class instances.
+    // Set by Read on '~C' markers; lets callers skip the expensive RestoreClasses traversal for class-free data.
     [ThreadStatic] private static bool _sawClassMarker;
 
-    // Resets '~C' marker detection for the current thread. Call before deserializing a batch of files.
     public static void ResetClassMarkerDetection() { _sawClassMarker = false; }
 
-    // True if Deserialize on this thread has seen at least one '~C' marker since the last reset
     public static bool HasReadClassMarkers() { return _sawClassMarker; }
 
-    // Class-name resolution is passed from PowerShell as System.Func<string, System.Type> (a BCL type,
-    // always resolvable at PowerShell class compile time) because user class types live in the session
-    // state, invisible to this assembly.
-
-    // Fast C# replacement for the slow PowerShell traversal in RestoreClassesScriptBlock/Phase 3:
-    // walks all container roots (IDictionary / Array / PSObject) iteratively with a stack and a
-    // reference-identity visited set, and collects '~C' hashtable nodes together with their exact
-    // parent container and slot (dictionary key / array index / property name). Nodes are appended
-    // in DFS order (containers before children); process the list in reverse to rehydrate children
-    // before their parents copy them out of raw hashtables.
+    // Collects '~C' hashtable nodes with their exact parent container and slot, walking all container roots iteratively with a visited set. DFS order: process the list in reverse (children before parents). Class-name resolver is passed from PowerShell because user class types live in session state, invisible to this assembly.
     public static List<object[]> CollectClassNodes(object[] roots) {
         var pending = new List<object[]>();
         if (roots == null) { return pending; }
@@ -302,11 +274,10 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                         }
                     }
                 } else {
-                    // Only descend into PSCustomObject instances (deserialized class-ish shapes);
-                    // other PSObject wrappers unwrap to their BaseObject elsewhere. PSCustomObject-typed
-                    // references do not expose the PSObject member collections, so access them through
-                    // the PSObject-typed view (AsPSObject returns the instance itself for PSObject values)
-                    if (node is System.Management.Automation.PSCustomObject && visited.Add(node)) {
+                        // PSCustomObject-shaped nodes arrive both as PSCustomObject values and as PSObject wrappers (JSON '~' marker readback); both cases must be handled or nested '~C' nodes are never collected
+                        PSObject psoNode = node as PSObject;
+                        bool isCustomObjectShape = (node is System.Management.Automation.PSCustomObject) || (psoNode != null && psoNode.BaseObject is System.Management.Automation.PSCustomObject);
+                        if (isCustomObjectShape && visited.Add(node)) {
                         foreach (var prop in PSObject.AsPSObject(node).Properties) {
                             if (prop.IsSettable && prop.Value != null) { stack.Push(new object[] { node, prop.Name, prop.Value }); }
                         }
@@ -317,10 +288,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return pending;
     }
 
-    // Fast C# replacement for the slow PowerShell rehydration in TryRehydrateScriptBlock:
-    // creates a live class instance and maps hashtable properties via reflection.
-    // conversion via LanguagePrimitives preserves PowerShell assignment semantics.
-    // Returns null when not applicable/possible - the caller then falls back to the PS scriptblock.
+    // Rehydrates a '~C' node into a live class instance via reflection; LanguagePrimitives preserves PS assignment semantics. Returns null when not possible - the caller falls back to the PS scriptblock.
     public static object RehydrateClassNode(System.Collections.IDictionary node, System.Func<string, System.Type> resolver) {
         if (node == null) { return null; }
         string className = node["~C"] as string;
@@ -347,12 +315,10 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     if (converted != null || !prop.PropertyType.IsValueType) { prop.SetValue(instance, converted); }
                     mapped = true;
                 } catch {
-                    // Skip properties that fail conversion instead of aborting the whole instance
                 }
             }
         }
-        // If the type exposes a LoadFromData method, let it rebuild derived/internal state
-        // (e.g. hidden caches like RollingSet.nodeDict) from the raw property map
+        // LoadFromData lets the type rebuild derived/internal state from the raw property map
         bool loaded = false;
         MethodInfo loadFromData = targetType.GetMethod("LoadFromData", BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
         if (loadFromData != null && loadFromData.GetParameters().Length == 1) {
@@ -365,9 +331,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return instance;
     }
 
-    // Collects the distinct '~C' class names from pending frames in one native pass. The caller then resolves
-    // each UNIQUE name once on the main session thread (user classes are only resolvable there) - O(unique
-    // classes) instead of O(nodes): tens of thousands of nodes resolve in milliseconds.
+    // Distinct '~C' class names: the caller resolves each unique name once on the main session thread (user classes resolve only there).
     public static string[] CollectUniqueClassNames(System.Collections.Generic.List<object[]> pending) {
         var seen = new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
         if (pending != null) {
@@ -384,14 +348,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return result;
     }
 
-    // Rehydrates '~C' nodes collected by CollectClassNodes and patches them into the live dictionaries in a
-    // single native pass. Designed to run in a BACKGROUND runspace: the caller resolves the class TYPES once
-    // on the main session thread (user classes live only in that session's state) and passes them as a
-    // name->Type map; Type objects are process-wide, so instantiation works from any thread. Per-type
-    // reflection data (writable properties, LoadFromData) is cached for the whole batch, and values whose
-    // runtime type already matches the property type skip LanguagePrimitives conversion. The PS scriptblock
-    // fallback is only used when psFallback is non-null (main-thread callers); a background runspace must
-    // pass null because the fallback needs main-session type resolution. Returns the count of rehydrated nodes.
+    // Rehydrates pending '~C' nodes in one pass, for a BACKGROUND runspace: types are resolved once on the main thread and passed as a name->Type map (Type objects are process-wide). Per-type reflection is batch-cached; matching runtime types skip conversion. psFallback must be null from a background runspace (needs main-session type resolution).
     public static int RehydratePendingNodes(
         System.Collections.Generic.List<object[]> pending,
         System.Collections.Generic.IDictionary<string, Type> typeMap,
@@ -472,7 +429,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             string slotKey = slot as string;
             if (slotKey == null) { slotKey = (slot == null) ? string.Empty : slot.ToString(); }
             if (rawMain != null && System.Object.ReferenceEquals(parent, rawMain)) {
-                // Depth-1 main value: patch live MainHT; merged only when not overridden by updates/removals
+                // Depth-1 main: patch live MainHT; merged unless overridden by updates/removals
                 if (liveMain != null) { liveMain[slotKey] = instance; }
                 bool overridden = (liveRemoved != null && liveRemoved.ContainsKey(slotKey)) || (rawUpdates != null && rawUpdates.Contains(slotKey));
                 if (!overridden && liveMerged != null) { liveMerged[slotKey] = instance; }
@@ -487,9 +444,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     dict[slot] = instance;
                 } else {
                     var arr = parent as System.Array;
-                    // System.Array has no [] indexer (CS0021) - SetValue is the non-generic write accessor.
-                    // Slot comes from CollectClassNodes which pushes int indices for zero-based rank-1
-                    // arrays (JSON deserialization produces object[]), matching the single-index overload.
+                    // System.Array has no [] indexer (CS0021) - SetValue is the non-generic accessor; CollectClassNodes pushes int indices for rank-1 arrays
                     if (arr != null && slot is int) { arr.SetValue(instance, (int)slot); }
                     else {
                         // PSCustomObject parent: replicate PowerShell dynamic property assignment semantics
@@ -506,9 +461,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return rehydratedCount;
     }
 
-    // Fast C# replacement for the slow PowerShell copy loops in Clone() and the save snapshot:
-    // builds a case-insensitive Hashtable from any IDictionary (hashtable, ConcurrentDictionary,
-    // generic Dictionary - all implement the non-generic IDictionary interface)
+    // Builds a case-insensitive Hashtable from any IDictionary
     public static System.Collections.Hashtable BuildHashtable(System.Collections.IDictionary source) {
         var ht = new System.Collections.Hashtable(System.StringComparer.OrdinalIgnoreCase);
         if (source == null) { return ht; }
@@ -531,7 +484,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return cd;
     }
 
-    // Fast C# replacement for slow PowerShell merge loops: merged = main + updates - removed
+    // merged = main + updates - removed
     public static System.Collections.Concurrent.ConcurrentDictionary<string, object> BuildMergedDictionary(System.Collections.Concurrent.ConcurrentDictionary<string, object> mainCd, System.Collections.Concurrent.ConcurrentDictionary<string, object> updatesCd, System.Collections.Concurrent.ConcurrentDictionary<string, object> removedCd) {
         var merged = new System.Collections.Concurrent.ConcurrentDictionary<string, object>(System.StringComparer.OrdinalIgnoreCase);
         if (mainCd != null) { foreach (var e in mainCd) { merged[e.Key] = e.Value; } }
@@ -546,26 +499,26 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             case JsonTokenType.True: return true;
             case JsonTokenType.False: return false;
             case JsonTokenType.Number:
-                // Try parsing from smallest to largest numeric type to match PowerShell native type semantics (e.g. Int32 for 1)
+                // Smallest type first, to match PowerShell native semantics (Int32 for 1)
                 if (reader.TryGetInt32(out int i)) return i;
                 if (reader.TryGetInt64(out long l)) return l;
                 if (reader.TryGetUInt64(out ulong ul)) return (decimal)ul;
                 if (reader.TryGetDecimal(out decimal dec)) return dec;
                 if (reader.TryGetDouble(out double d)) return d;
-                // Last-resort fallback for multi-segment numbers. NOTE: Do not replace this with ValueSequence operations (e.g. CopyTo or ToArray). PowerShell Add-Type compiler struggles with System.Memory/Span<T> extension methods (CS1061/CS1929). Multi-segment numbers are practically impossible in standard JSON (numbers are short tokens). Returning 0 for this impossible edge case is the safest compatible fallback.
+                // Do not use ValueSequence/Span<T> ops here - the Add-Type compiler fails on them (CS1061/CS1929). Multi-segment numbers are practically impossible in JSON; returning 0 is the safe fallback.
                 if (!reader.HasValueSequence) {
                     return System.Text.Encoding.UTF8.GetString(reader.ValueSpan.ToArray());
                 }
                 return 0;
             case JsonTokenType.String:
-                // ISO 8601 starts with 'yyyy-MM-dd' so position 4 must be '-'. Note: TryGetDateTime only (not DateTimeOffset) to maintain backward compatibility with consuming modules that expect System.DateTime. NOTE: Do not use reader.ValueSpan here. PowerShell Add-Type compiler struggles with System.Memory/Span<T> extension methods (CS1061/CS1929).
+                // ISO 8601 heuristic: position 4 must be '-'. TryGetDateTime only (consumers expect System.DateTime). Do not use ValueSpan - Add-Type fails on Span<T> ops (CS1061/CS1929).
                 var str = reader.GetString();
                 if (str != null && str.Length >= 10 && str[4] == '-' && str[0] >= '0' && str[0] <= '9') {
                     if (reader.TryGetDateTime(out DateTime dt)) return dt;
                 }
                 return str;
             case JsonTokenType.StartObject:
-                // Map JSON objects to case-insensitive Hashtable to match PowerShell semantics. If __PSCustomObject__ marker is present, deserialize as PSCustomObject (PSObject) to preserve exact type.
+                // Case-insensitive Hashtable; '~' marker restores PSCustomObject
                 var ht = new Hashtable(StringComparer.OrdinalIgnoreCase);
                 bool isPsCustomObject = false;
                 // '~i' marker: all keys of the source dictionary were Int32; restore them as Int32 keys
@@ -599,14 +552,13 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     }
                     string propName = reader.GetString();
                     reader.Read();
-                    // Track '~C' class markers so callers can skip the RestoreClasses traversal when no classes are present
                     if (propName == "~C") { _sawClassMarker = true; }
-                    // Intercept short marker to restore exact type. '~' is used as a rare single-byte property name to minimize JSON size without clashing with standard PS properties.
+                    // '~' marker: single-byte name, cannot clash with standard PS properties
                     if (propName == "~" && reader.TokenType == JsonTokenType.True) {
                         isPsCustomObject = true;
                         continue;
                     }
-                    // Int32 key marker: written only when ALL source keys were Int32, so a real "~i" string key never coexists with it
+                    // Written only when ALL source keys were Int32
                     if (propName == "~i" && reader.TokenType == JsonTokenType.True) {
                         isIntKeys = true;
                         continue;
@@ -669,18 +621,10 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         }
     }
 
-    // Entry point for serialization. Manages depth tracking to prevent infinite loops.
-    // DIAGNOSTICS: System.Text.Json wraps any non-JsonException thrown by a converter into a generic
-    // JsonException ("The object or value could not be serialized. Path: $.") that hides the real
-    // cause in InnerException - and the path is always "$." because this converter serializes the
-    // whole graph itself. Rethrowing as JsonException with the failing value's TYPE builds a chain
-    // from root to culprit (JsonException passes through the STJ wrapper unwrapped), so the
-    // innermost message names the exact type that could not be serialized.
+    // STJ wraps non-JsonException converter throws into a generic JsonException hiding the real cause. Rethrowing as JsonException with the failing value's TYPE builds a chain naming the exact culprit type (JsonException passes the wrapper unwrapped).
     public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options) {
         if (value == null) { writer.WriteNullValue(); return; }
-        // Cycle guard: only reference-type containers are tracked (scalars cannot cycle, and
-        // tracking millions of unique strings would waste memory). A revisit while the object is
-        // still on the serialization stack = circular reference -> cut it with a marker.
+        // Only containers are tracked (scalars cannot cycle); a revisit = cycle -> marker
         bool tracked = false;
         if (value is PSObject || value is System.Collections.IDictionary || value is System.Collections.IList) {
             if (_activeObjects.Contains(value)) {
@@ -721,17 +665,11 @@ public class PSObjectJsonConverter : JsonConverter<object> {
     private void WriteInternal(Utf8JsonWriter writer, object value, JsonSerializerOptions options) {
         if (value == null) { writer.WriteNullValue(); return; }
 
-        // Unwrap PSObject only when NOT PSCustomObject, otherwise we'd lose deserialized properties.
-        // A PSObject whose BaseObject is a raw Hashtable is a deserialization half-product with the
-        // entries stored INSIDE the BaseObject (PSSerializer.Deserialize materializes it this way).
-        // It MUST be unwrapped: the kind=1 dictionary branch below then serializes the entries.
-        // Keeping it wrapped would send it to the PSObject property-map branch, which enumerates the
-        // .NET reflection properties of the Hashtable CLASS (Count/Keys/Values/SyncRoot) instead of
-        // the dictionary entries - losing all payload fields.
+        // Unwrap PSObject unless PSCustomObject. A wrapped Hashtable must be unwrapped, or the PSObject branch enumerates the Hashtable CLASS's reflection properties (Count/Keys/Values) instead of the entries.
         if (value is PSObject) {
             PSObject psoVal = (PSObject)value;
             if (!(psoVal.BaseObject is PSObject) && psoVal.BaseObject.GetType() != typeof(System.Management.Automation.PSCustomObject)) {
-                // For deserialized collections (e.g., Hashtable+ValueCollection), PSSerializer wraps IE items in an ArrayList and stores the original keyed data in a SyncRoot NoteProperty. Unwrapping to BaseObject correctly serializes the array of values. Replacing it with SyncRoot would incorrectly promote the underlying Hashtable, causing it to be serialized and loaded as a Hashtable instead of an array.
+                // PSSerializer wraps deserialized collections in an ArrayList; unwrap to BaseObject, not SyncRoot (which would wrongly promote the underlying Hashtable)
                 value = psoVal.BaseObject;
             }
         }
@@ -742,7 +680,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         // Serialize dictionaries based on their generic/non-generic nature
         if (kind == 1) {
             writer.WriteStartObject();
-            // Snapshot entries and detect all-Int32 keys to emit the '~i' marker for exact key type restoration
+            // Snapshot entries; emit '~i' when all keys are Int32
             var dictEntries = new List<DictionaryEntry>();
             bool hasEntries = false;
             bool allIntKeys = true;
@@ -763,10 +701,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             writer.WriteEndObject();
         } else if (kind == 2) {
             writer.WriteStartObject();
-            // Fast path for string-keyed object-valued dictionaries: ConcurrentDictionary<string,object> is
-            // the primary in-memory type of HashTableDB1, and typed enumeration avoids DLR dynamic dispatch
-            // and KeyValuePair boxing on every entry. String keys can never be Int32, so the '~i' marker does
-            // not apply here. Snapshot semantics match the dynamic path below.
+            // Typed fast path for ConcurrentDictionary<string,object> (avoids DLR dispatch and boxing); '~i' never applies to string keys
             var strDict = value as System.Collections.Generic.IDictionary<string, object>;
             if (strDict != null) {
                 var strEntries = new List<KeyValuePair<string, object>>(strDict);
@@ -775,7 +710,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     Write(writer, entry.Value, options);
                 }
             } else {
-                // Snapshot entries and detect all-Int32 keys to emit the '~i' marker for exact key type restoration
+                // Snapshot entries; emit '~i' when all keys are Int32
                 var genEntries = new List<dynamic>();
                 bool hasGenEntries = false;
                 bool allGenIntKeys = true;
@@ -809,7 +744,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             writer.WriteEndArray();
         // Serialize PSCustomObject properties directly
         } else if (value is PSObject) {
-            // Serialize PSObject properties directly without losing them. Add a short marker property to ensure it deserializes back as a PSObject (PSCustomObject), not a Hashtable.
+            // '~' marker ensures deserialization back to PSCustomObject, not Hashtable
             PSObject pso = (PSObject)value;
             writer.WriteStartObject();
             writer.WritePropertyName("~");
@@ -884,7 +819,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
             JsonSerializer.Serialize(writer, value, t, options);
         // Fallback to CLIXML for any complex object that cannot be natively mapped to JSON
         } else {
-            // PowerShell classes and user-defined (non System/Microsoft namespace) types are serialized as a property map with a '~C' class-name marker so RestoreClasses can rehydrate real class instances after load. System.*/Microsoft.* types (X509Certificate2 etc.) keep the CLIXML fallback below.
+            // User types -> '~C' property map for rehydration; System.*/Microsoft.* types -> CLIXML fallback
             string typeNamespace = t.Namespace ?? string.Empty;
             bool isUserType = !typeNamespace.StartsWith("System", System.StringComparison.Ordinal) && !typeNamespace.StartsWith("Microsoft", System.StringComparison.Ordinal);
             if (isUserType) {
@@ -900,7 +835,6 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                 }
                 writer.WriteEndObject();
             } else {
-                // Fallback for complex types (X509Certificate2 etc.)
                 try {
                     string clixml = PSSerializer.Serialize(value);
                     clixml = _xmlMinifyRegex.Replace(clixml, "><");
@@ -909,10 +843,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
                     writer.WriteStringValue(clixml);
                     writer.WriteEndObject();
                 } catch {
-                    // Last-resort: NEVER stringify containers (IDictionary/IList/PSObject) - their
-                    // ToString() is a debug dump ("@{A=1; B=2}") that loses all nested data and
-                    // deserializes as a useless string value. Write a null instead so the loss is
-                    // visible instead of silently corrupted (a string that pretends to be an object).
+                    // Never stringify containers: ToString() is a debug dump losing nested data. Write null so the loss is visible.
                     if (value is PSObject || value is System.Collections.IDictionary || value is System.Collections.IList) {
                         writer.WriteNullValue();
                     } else {
@@ -923,10 +854,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         }
     }
 
-    // Collects pending transaction entries newer than cutoffTick in one lock-free pass over the
-    // per-key op map (HashTableDB1.KeyToTx). Values were captured at op-registration time, so the
-    // entries are exact replay records. Returns [0] = List<object[]> of (op, key, value, tick) arrays
-    // - the on-disk txlog format, [1] = firstTick, [2] = lastTick (both 0 when nothing is pending).
+    // Pending tx entries newer than cutoffTick from KeyToTx (exact replay records, values captured at op time). Returns [entries, firstTick, lastTick].
     public static object[] CollectPendingTxEntries(
         System.Collections.Concurrent.ConcurrentDictionary<string, object> keyToTx,
         long cutoffTick) {
@@ -946,10 +874,7 @@ public class PSObjectJsonConverter : JsonConverter<object> {
         return new object[] { entries, first, last };
     }
 
-    // Drops entries with tick <= savedTick after a SUCCESSFUL txlog write. The ReferenceEquals guard
-    // keeps records that a concurrent RegisterTxOp has just overwritten with a newer tick. New ticks
-    // are issued strictly above the generator watermark, so a concurrently registered op can never
-    // carry tick <= savedTick.
+    // Drops entries with tick <= savedTick after a successful write; ReferenceEquals keeps records concurrently overwritten with a newer tick
     public static int TrimSavedTxEntries(
         System.Collections.Concurrent.ConcurrentDictionary<string, object> keyToTx,
         long savedTick) {
@@ -999,8 +924,7 @@ public class TxTickGenerator {
 }
 '@
 }
-# Verify the loaded converter actually contains the static helpers the load path depends on.
-# Catches a file where the C# converter edits were not applied (methods missing after compilation).
+# Verify required static helpers exist (catches a file with unapplied C# converter edits)
 foreach ($requiredConverterMethod in 'ResetClassMarkerDetection','HasReadClassMarkers','BuildConcurrentDictionary','BuildMergedDictionary','BuildHashtable','CollectClassNodes','RehydrateClassNode','CollectUniqueClassNames','RehydratePendingNodes','CollectPendingTxEntries','TrimSavedTxEntries') {
     if (-not [PSObjectJsonConverter].GetMethod($requiredConverterMethod, [System.Reflection.BindingFlags]'Public, Static')) {
         throw "PSObjectJsonConverter is missing static method '$requiredConverterMethod' - the C# converter edits were not applied to this file. Apply them, then restart the PowerShell session and run again."
@@ -1048,7 +972,7 @@ if (-not ('TxTickGenerator' -as [type])) {
             }
             Write-Host "Created backup: $newBackupName"
         }
-        # All backup files for this backup. Matches current-format backups, legacy XML backups and cross-format archived JSON backups. Escape baseName to avoid regex injection.
+        # Matches current, legacy XML and cross-format backups; Escape avoids regex injection
         $rxBak = [regex]::new('^' + [regex]::Escape($baseName) + '\.\d{8}-\d{6}(\.(xml|json))?$')
         $backupFiles = [System.IO.Directory]::GetFiles($oldFolder, "$baseName.*") |
             ForEach-Object { [System.IO.FileInfo]::new($_) } |
@@ -1056,9 +980,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         # Coerce to array so .Count is reliable for single-element results
         $backupFiles = @($backupFiles)
         if ($backupFiles.Count -gt $bakCount) {
-            # Sort by Name (yyyyMMdd-HHmmss is lexicographically chronological)
             $filesToDelete = $backupFiles | Sort-Object Name | Select-Object -First ($backupFiles.Count - $bakCount)
-            # Deleting oldest files with retry for high-load file locking
             foreach ($fileToDelete in $filesToDelete) {
                 for ($i = 0; $i -lt 5; $i++) {
                     try {
@@ -1071,7 +993,6 @@ if (-not ('TxTickGenerator' -as [type])) {
             }
         }
     } # Of _MoveOld
-    # Helper for resilient file ops with retry on IO contention (AV, indexer, etc.)
     function _RetryFileOp {
         param([scriptblock]$Op, [int]$Attempts = 5, [int]$DelayMs = 100)
         for ($i = 0; $i -lt $Attempts; $i++) {
@@ -1086,21 +1007,15 @@ if (-not ('TxTickGenerator' -as [type])) {
         $startDateTime = [System.Datetime]::Now
         # DIAGNOSTICS: coarse stage marker, included in the error message when the save fails
         $saveStage = 'init'
-        # State watermark for replay/sync: read BEFORE any snapshot serialization. RegisterTxOp is
-        # called AFTER the state writes, so every op with tick <= this value is already reflected in
-        # UpdatesHT/MergedHT/RemovedHT and captured by the serializations below. Interlocked read -
-        # the save runs on a background runspace thread
+        # Watermark read BEFORE snapshot serialization (ops with tick <= this are already in the serialized state); Interlocked - the save runs on a background thread
         $stateAsOfTick = $thisObj.TxTickGenerator.Current
         $jsonOptions = [System.Text.Json.JsonSerializerOptions]::new()
         $jsonOptions.Converters.Add([PSObjectJsonConverter]::new())
         # Disable escaping of <, > and non-ASCII to reduce JSON size
         $jsonOptions.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
-        # Raise the writer depth limit above the converter's own MaxDepth (100): deep-but-finite
-        # graphs (migrated CLIXML wrapper chains) exceed the writer default of 64 before the
-        # converter-level circular-reference guard fires, which aborts the whole save
+        # Writer depth must exceed the converter MaxDepth (see WriterMaxDepth in the C# code)
         $jsonOptions.MaxDepth = 128
-        # Storage format: 'Json' (default) or 'Xml' (CLIXML compatibility mode). All file names are
-        # parameterized by extension so the folder always holds files of a single format.
+        # 'Json' (default) or 'Xml' (CLIXML compatibility mode)
         if ($thisObj.StorageFormat -notin @('Json','Xml')) { throw "Invalid StorageFormat '$($thisObj.StorageFormat)' - use 'Json' or 'Xml'." }
         $ext = 'json'
         if ($thisObj.StorageFormat -eq 'Xml') { $ext = 'xml' }
@@ -1114,13 +1029,10 @@ if (-not ('TxTickGenerator' -as [type])) {
             $saveStage = 'main-serialize'
             $tmpMain = "$($dbBase)_main.$ext.tmp"
             if ($ext -eq 'xml') {
-                # CLIXML compatibility mode. Explicit depth is required: the parameterless Serialize
-                # overload silently truncates nested objects at depth 2.
+                # CLIXML; explicit depth required - the parameterless overload truncates at depth 2
                 [System.IO.File]::WriteAllText($tmpMain, [System.Management.Automation.PSSerializer]::Serialize($mainSnap, 100))
             } else {
-                # OPTIMIZATION: System.Text.Json streaming directly to FileStream.
-                # Stream is disposed in finally to release handle even on serialization failure.
-                # 1MB buffer: fewer, larger write syscalls on multi-hundred-MB JSON files
+                # Stream to file directly; 1MB buffer = fewer syscalls on large files
                 $stream = [System.IO.File]::Create($tmpMain, 1048576)
                 try {
                     [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$mainSnap, $jsonOptions)
@@ -1142,9 +1054,7 @@ if (-not ('TxTickGenerator' -as [type])) {
                 $stream.Dispose()
             }
         }
-        # Adding database parameters to a copy for serialization (avoid polluting live RemovedHT).
-        # C# helper replaces the slow PowerShell copy loop; the type is process-wide, so it resolves
-        # both on the calling thread and inside the background runspace
+        # Copy so the live RemovedHT stays clean; the C# helper resolves in any runspace
         $removedForSave = [PSObjectJsonConverter]::BuildHashtable($removedSnap)
         # Database parameters travel inside the deletes snapshot (read back by the load path)
         $removedForSave["___DATABASEPARAMS___"] = $thisObj.DatabaseParamsHT
@@ -1210,9 +1120,7 @@ if (-not ('TxTickGenerator' -as [type])) {
                 }
             }
         }
-        # Cross-format cleanup: after a successful commit in the current format, archive or remove files of
-        # the other format so only one format is ever present in the folder (prevents stale files from being
-        # picked up by the json-first load order on the next run)
+        # Keep only one format in the folder (stale other-format files would be picked up by the json-first load)
         $otherExt = 'xml'
         if ($ext -eq 'xml') { $otherExt = 'json' }
         $legacyFiles = @(
@@ -1243,19 +1151,14 @@ if (-not ('TxTickGenerator' -as [type])) {
             }
         }
         $endDateTime = [System.Datetime]::Now
-        # The persisted files now reflect every op with tick <= the watermark - publish it so
-        # callers can track the replay position without reloading
+        # Persisted state now matches the watermark - publish it
         $thisObj.DbStateAsOfTick = $stateAsOfTick
         $thisObj.AsyncResults['Success'] = $true
         $thisObj.AsyncResults['Message'] = "Asynchronous save of database $($thisObj.DatabaseFileName) started $($startDateTime.ToString("yyyy.MM.dd HH:mm:ss")) completed in $([math]::Round((($endDateTime-$startDateTime).TotalSeconds),3)) sec."
     } catch {
         $thisObj.AsyncResults['Success'] = $false
         $thisObj.AsyncResults['Error']   = $_
-        # DIAGNOSTICS: unwrap the full inner-exception chain. System.Text.Json hides the real cause
-        # of converter failures inside InnerException (outer message: "The object or value could not
-        # be serialized. Path: $."), and the default .Message shows only that generic wrapper.
-        # The chain levels carry the value types from the C# Write diagnostics - the innermost
-        # level names the exact type that failed.
+        # DIAGNOSTICS: unwrap the inner-exception chain - STJ hides the converter's real cause in a generic wrapper; the innermost level names the failing type
         $errChain = $_.Exception.Message
         $innerEx = $_.Exception.InnerException
         $chainDepth = 0
@@ -1267,7 +1170,6 @@ if (-not ('TxTickGenerator' -as [type])) {
         if ($saveStage) { $errChain += "`nStage: $saveStage" }
         if ($_.ScriptStackTrace) { $errChain += "`nScriptStackTrace:`n$($_.ScriptStackTrace)" }
         $thisObj.AsyncResults['Message'] = "Async save error: $errChain"
-        # Cleanup tmp files on error to prevent orphans
         foreach($p in @($tmpMain,$tmpUpdates,$tmpDeletes)){
             if ($p -and [System.IO.File]::Exists($p)) {
                 for ($i = 0; $i -lt 3; $i++) {
@@ -1276,8 +1178,10 @@ if (-not ('TxTickGenerator' -as [type])) {
             }
         }
     } finally {
-        # Release the flag only on success path. On error keep it true to force next save to write main DB.
+        # Keep IsForceSaveMain only when the failure happened at/before 'main-serialize' (main tmp may be torn); later stages leave the main file untouched
         if ($thisObj.AsyncResults -and $thisObj.AsyncResults['Success']) {
+            $thisObj.IsForceSaveMain = $false
+        } elseif ($saveStage -in @('updates-serialize', 'deletes-serialize', 'rename-swap')) {
             $thisObj.IsForceSaveMain = $false
         }
     }
@@ -1300,7 +1204,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         # Reset '~C' detection so the result can report whether any class instances exist in this load batch
         [PSObjectJsonConverter]::ResetClassMarkerDetection()
 
-        # Optimized I/O: Using .NET File.Exists which is significantly faster than Get-Item -ErrorAction SilentlyContinue. Supports backward compatibility by checking for .json first, then falling back to legacy .xml
+        # .json preferred, legacy .xml fallback
         $mainJsonPath = "$($fullPath)_main.json"
         $mainXmlPath = "$($fullPath)_main.xml"
         $MainFile2Load = $null
@@ -1326,10 +1230,7 @@ if (-not ('TxTickGenerator' -as [type])) {
             $DeletesFile2Load = [System.IO.FileInfo]::new($deletesXmlPath)
         }
 
-        # Recovery logic. If JSON is missing, validate backups before restoring. If .tmp is corrupted,
-        # it falls back to .old without overwriting the good .old with bad .tmp. One helper replaces the
-        # three formerly copy-pasted per-file blocks; it reads $jsonOptions from the caller scope
-        # (dynamic scoping) instead of taking it as a parameter.
+        # Restore from .tmp/.old, validating content first (never overwrite a good .old with a bad .tmp). $jsonOptions read from the caller scope.
         function _RestoreFromBackup {
             param(
                 [string] $basePath,  # file-set base ("$($fullPath)_main" etc): probes <base>.tmp then <base>.old
@@ -1408,9 +1309,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         $shouldLoadMain = ($null -eq $thisObj.MainFileLoadedDT) -or ($MainFile2Load.LastWriteTime -gt $thisObj.MainFileLoadedDT)
         $shouldLoadUpdates = ($null -eq $thisObj.UpdatesFileLoadedDT) -or ($UpdatesFile2Load -and $UpdatesFile2Load.LastWriteTime -gt $thisObj.UpdatesFileLoadedDT)
         $shouldLoadDeletes = ($null -eq $thisObj.RemovedFileLoadedDT) -or ($DeletesFile2Load -and $DeletesFile2Load.LastWriteTime -gt $thisObj.RemovedFileLoadedDT)
-        # Shared loader for one file set: primary file, then .old fallback. Returns a package
-        # @{ Data = <IDictionary|$null>; Error = <last exception message|$null> }. Collapses the three
-        # formerly copy-pasted blocks (LFX2/LFX4/LFX6 paths); reads $jsonOptions from the caller scope.
+        # Shared loader: primary file, then .old fallback; returns @{ Data; Error }. $jsonOptions from the caller scope.
         function _LoadDatabaseFile {
             param(
                 [System.IO.FileInfo] $File2Load,  # primary file (.json preferred, legacy .xml supported)
@@ -1431,9 +1330,7 @@ if (-not ('TxTickGenerator' -as [type])) {
                             $stream.Dispose()
                         }
                     } else {
-                        # .old files carry no format-defining extension - sniff the content instead:
-                        # CLIXML starts with '<', JSON with '{'. Without this, a JSON-filled .old would be
-                        # fed to PSSerializer and the fallback would always fail.
+                        # Sniff .old content: CLIXML ('<') vs JSON ('{')
                         $rawContent = [System.IO.File]::ReadAllText($tryFile)
                         if ($rawContent.TrimStart().StartsWith('<')) {
                             $loaded = [System.Management.Automation.PSSerializer]::Deserialize($rawContent)
@@ -1495,10 +1392,9 @@ if (-not ('TxTickGenerator' -as [type])) {
                 if (-Not ($resultData.DatabaseParamsHT -is [System.Collections.IDictionary])) {
                     $resultData.DatabaseParamsHT = @{}
                 }
-                # Restoring the state watermark (absent in files written by older versions - stays 0)
+                # Absent in older files - stays 0
                 $dbStateTick = $resultData.RemovedHT["___DBSTATEASTOFTICK___"]
                 if ($null -ne $dbStateTick) { $resultData.DbStateAsOfTick = [long]$dbStateTick }
-                # Strip the marker so it does not leak into the live RemovedHT as a tombstone
                 $resultData.RemovedHT.Remove("___DBSTATEASTOFTICK___")
             } else {
                 $resultData.Success = $false
@@ -1530,13 +1426,10 @@ if (-not ('TxTickGenerator' -as [type])) {
         [object] $thisObj,
         [string] $txLogFolder
     )
-    # Serialize ALL invocations (sync inline runs + background runspace): the sync path does not
-    # register itself in the async state container, so this lock is the only mutual-exclusion point
+    # The sync path is invisible to the async state container - this lock is the only mutual-exclusion point
     [System.Threading.Monitor]::Enter($thisObj.TxLogSaveLock)
     try {
-        # Single native pass over the per-key op map: collect records newer than the persisted
-        # cutoff. Entries carry values captured at op-registration time, so they are exact replay
-        # records - no value re-read from MergedHT, no phantom nulls under concurrent removes
+        # Exact replay records (values captured at op time - no phantom nulls under concurrent removes)
         $pack = [PSObjectJsonConverter]::CollectPendingTxEntries($thisObj.KeyToTx, $thisObj.LastTransactionLogSavedTimestamp)
         $txList = $pack[0]
         $firstTick = [long]$pack[1]
@@ -1547,9 +1440,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         if (-not [System.IO.Directory]::Exists($txLogFolder)) {
             $null = [System.IO.Directory]::CreateDirectory($txLogFolder)
         }
-        # Atomic write: tmp + rename, same pattern as the main DB save. A crash mid-write can only
-        # leave an orphan .tmp, never a torn .txlog, so file ranges stay strictly increasing and
-        # non-overlapping for replay (ticks are monotonic and the cutoff advances only on success)
+        # Atomic tmp + rename: a crash leaves an orphan .tmp, never a torn .txlog; ranges stay non-overlapping
         $fileName = "$($thisObj.DatabaseFileName)_$firstTick`_$lastTick.txlog"
         $fullPath = Join-Path $txLogFolder $fileName
         $tmpPath = "$fullPath.tmp"
@@ -1563,8 +1454,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         $stream = [System.IO.File]::Create($tmpPath, 1048576)
         try {
             [System.Text.Json.JsonSerializer]::Serialize($stream, [object]$txList, $jsonOptions)
-            # Durability option: force bytes to physical disk before the file becomes visible - the
-            # point of a recovery log. Costs an I/O stall; opt-in, off for pure sync usage
+            # Opt-in fsync before visibility; costs an I/O stall
             if ($thisObj.TxLogFlushToDisk) { $stream.Flush($true) }
         } finally {
             $stream.Dispose()
@@ -1579,14 +1469,11 @@ if (-not ('TxTickGenerator' -as [type])) {
                 if ($i -eq 4) { throw }
             }
         }
-        # Advance cutoff, compat tick and trim the in-memory map ONLY after a successful commit.
-        # On any failure above, records stay pending and the next save rewrites the same tick range
-        # under the same file name (idempotent overwrite)
+        # Advance cutoff/tick and trim ONLY after a successful commit (failure = idempotent retry of the same range)
         $thisObj.LastTransactionLogSavedTimestamp = $lastTick
         $thisObj.LastTxLogTick = $lastTick
         $null = [PSObjectJsonConverter]::TrimSavedTxEntries($thisObj.KeyToTx, $lastTick)
-        # GC orphaned .tmp files (crash leftovers). The age guard covers a foreign in-flight writer -
-        # another DB instance with the same name/folder holds its own TxLogSaveLock object
+        # GC orphaned .tmp; the age guard covers a foreign in-flight writer (separate TxLogSaveLock)
         $rxTmp = [regex]::new('^' + [regex]::Escape($thisObj.DatabaseFileName) + '_\d+_\d+\.txlog\.tmp$')
         $tmpCutoff = [datetime]::Now.AddHours(-1)
         foreach ($f in [System.IO.Directory]::GetFiles($txLogFolder, "*.txlog.tmp")) {
@@ -1594,9 +1481,7 @@ if (-not ('TxTickGenerator' -as [type])) {
                 try { [System.IO.File]::Delete($f) } catch { }
             }
         }
-        # Retention governs FILES ONLY: the in-memory map is already bounded by the trim above (it
-        # holds only the unsaved delta, not a retention window of history). Regex check first (pure
-        # CPU, no I/O), GetLastWriteTime avoids FileInfo allocation
+        # Retention governs files only (the in-memory map holds just the unsaved delta)
         if ($thisObj.TxLogRetentionDays -gt 0) {
             $cutoff = [datetime]::UtcNow.AddDays(-$thisObj.TxLogRetentionDays).ToLocalTime()
             $rx = [regex]::new('^' + [regex]::Escape($thisObj.DatabaseFileName) + '_(\d+)_(\d+)\.txlog$')
@@ -1640,7 +1525,7 @@ if (-not ('TxTickGenerator' -as [type])) {
         $instance = New-Object -TypeName $targetType -ErrorAction Stop
     } catch {
         $instance = $null
-        # No parameterless constructor: map constructor parameters from hashtable keys (case-insensitive), falling back to default values (0 for value types, $null for references)
+        # Map ctor params from hashtable keys, default values otherwise
         $ctors = @($targetType.GetConstructors() | Sort-Object { $_.GetParameters().Count })
         foreach ($ctor in $ctors) {
             $ctorArgs = @()
@@ -1666,7 +1551,6 @@ if (-not ('TxTickGenerator' -as [type])) {
                 $instance."$k" = $Node[$k]
                 $mapped = $true
             } catch {
-                # Skip properties that fail conversion instead of aborting the whole instance
             }
         }
     }
@@ -1679,53 +1563,60 @@ if (-not ('TxTickGenerator' -as [type])) {
     return $null
 }
 
-# Async load composite: keeps ALL heavy work (deserialization, ConcurrentDictionary building, TxLog state reset,
-# '~C' node collection) inside the background runspace, so the InvocationStateChanged event action in the main
-# session stays lightweight and does not freeze the GUI script. Class rehydration itself cannot run here
-# (user classes are not resolvable in this runspace) - collected nodes are rehydrated by the event action.
+# Async load: ALL heavy work runs in the background runspace (the main-thread event action must stay lightweight). Class rehydration runs later on the main thread - user classes are not resolvable here.
  $Script:HashtableDB1Class_LoadAsyncScriptBlock = {
     param([object]$thisObj, [object]$loadScriptBlock)
-    # Phase 1: raw deserialization (JSON with legacy XML fallback) - identical to the synchronous path.
-    # The load scriptblock is passed as an argument because $Script: scope of the main session does not
-    # exist in the background runspace (AddScript re-parses scriptblock text in the pool session state).
-    # Re-create it from text so it binds to this runspace, not to the main-session affinity of the object.
+    # Phase 1: raw deserialization, identical to the sync path. The scriptblock is re-created from text: $Script: scope does not exist in this runspace.
     $loadResult = & ([scriptblock]::Create($loadScriptBlock.ToString())) $thisObj
     if (-not ($loadResult.Success -and $loadResult.DataIsLoaded)) { return $loadResult }
-    # Phase 2 (background runspace): build ConcurrentDictionaries and publish them to the live object.
-    # The same cross-runspace mutation pattern is already used by the save path (AsyncResults, IsForceSaveMain).
-    # Assignment order matters for concurrent readers: MergedHT is swapped last, so Get() keeps serving
-    # the old consistent view until the very end of the swap.
-    if ($null -ne $loadResult.MainHT) {
+    # Phase 2: build CDs and publish; MergedHT swaps last so concurrent readers see a consistent view
+    $mainRebuilt = $null -ne $loadResult.MainHT
+    if ($mainRebuilt) {
         $thisObj.MainHT = [PSObjectJsonConverter]::BuildConcurrentDictionary($loadResult.MainHT, $null)
     }
     if ($null -ne $loadResult.UpdatesHT) {
         $thisObj.UpdatesHT = [PSObjectJsonConverter]::BuildConcurrentDictionary($loadResult.UpdatesHT, $null)
     }
     if ($null -ne $loadResult.RemovedHT) {
-        # Do not load the internal DB params marker into the live RemovedHT
         $thisObj.RemovedHT = [PSObjectJsonConverter]::BuildConcurrentDictionary($loadResult.RemovedHT, "___DATABASEPARAMS___")
         $thisObj.DatabaseParamsHT = $loadResult.DatabaseParamsHT
-    } else {
-        $thisObj.DatabaseParamsHT = @{}
     }
+    # else (deletes not reloaded): PRESERVE live DatabaseParamsHT - params live only in the deletes file, resetting would discard unsaved in-memory changes
     $thisObj.MainFileLoadedDT = $loadResult.MainFileLoadedDT
     $thisObj.UpdatesFileLoadedDT = $loadResult.UpdatesFileLoadedDT
     $thisObj.RemovedFileLoadedDT = $loadResult.RemovedFileLoadedDT
-    # Restore the state watermark and keep future ticks strictly above it: a machine with a lagging
-    # clock must not issue ticks below the loaded state (LWW/sync correctness)
-    $thisObj.DbStateAsOfTick = $loadResult.DbStateAsOfTick
-    $thisObj.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
-    # Rebuild merged hashtable, then assign atomically (C# helper - fast)
-    $thisObj.MergedHT = [PSObjectJsonConverter]::BuildMergedDictionary($thisObj.MainHT, $thisObj.UpdatesHT, $thisObj.RemovedHT)
-    # Clear TxLog in-memory state since DB state is fully replaced by loaded data (unconditional: a
-    # later EnableTransactionLog must not see pre-load leftovers)
-    $thisObj.KeyToTx.Clear()
+    # Guarded by the actual deletes reload: the watermark travels only in the deletes file (default 0), so an unconditional assign on a partial load would reset it and re-apply already-persisted entries. Bootstrap(0) never lowers the generator watermark.
+    if ($null -ne $loadResult.RemovedHT) {
+        $thisObj.DbStateAsOfTick = $loadResult.DbStateAsOfTick
+        $thisObj.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
+    }
+    if ($mainRebuilt) {
+        $thisObj.MergedHT = [PSObjectJsonConverter]::BuildMergedDictionary($thisObj.MainHT, $thisObj.UpdatesHT, $thisObj.RemovedHT)
+    } else {
+        # Main unchanged: upsert/remove the reloaded snapshots onto the live merged view (avoids an O(main) rebuild)
+        if ($null -ne $loadResult.UpdatesHT) {
+            foreach ($k in $thisObj.UpdatesHT.Keys) { $thisObj.MergedHT[$k] = $thisObj.UpdatesHT[$k] }
+        }
+        if ($null -ne $loadResult.RemovedHT) {
+            foreach ($k in $thisObj.RemovedHT.Keys) { $null = $thisObj.MergedHT.TryRemove($k, [ref]$null) }
+        }
+    }
+    # Keep a TxLog record only when its effect survived: 'A' lives in UpdatesHT, 'R' in RemovedHT. Replaced-from-disk components discard their records; an unconditional Clear() would lose still-live records.
+    if (($null -ne $loadResult.UpdatesHT) -or ($null -ne $loadResult.RemovedHT)) {
+        $keepUpdatesEffects = ($null -eq $loadResult.UpdatesHT)
+        $keepRemovedEffects = ($null -eq $loadResult.RemovedHT)
+        $staleTxKeys = [System.Collections.Generic.List[string]]::new()
+        foreach ($txEntry in $thisObj.KeyToTx) {
+            $txRec = $txEntry.Value -as [System.Tuple[long,string,object]]
+            if (-not $txRec) { continue }
+            if (($txRec.Item2 -eq 'A') -and (-not $keepUpdatesEffects)) { $null = $staleTxKeys.Add($txEntry.Key) }
+            elseif (($txRec.Item2 -eq 'R') -and (-not $keepRemovedEffects)) { $null = $staleTxKeys.Add($txEntry.Key) }
+        }
+        foreach ($staleTxKey in $staleTxKeys) { $null = $thisObj.KeyToTx.TryRemove($staleTxKey, [ref]$null) }
+    }
+    # Safe: the map holds only never-persisted entries, so 0 merely re-collects survivors
     $thisObj.LastTransactionLogSavedTimestamp = 0
-    # Phase 3 (background, cheap): collect '~C' hashtable nodes for main-session rehydration.
-    # Skipped entirely when the converter saw no '~C' markers during Phase 1 (same thread) - the
-    # full-tree traversal is the most expensive post-load step for large class-free datasets.
-    # Nodes are appended in DFS order (containers before children); the event action processes the list
-    # in reverse so nested instances are rehydrated before their containers copy them out of raw hashtables.
+    # Phase 3: collect '~C' nodes (skipped when no markers were seen); the event action processes the list in reverse (children first)
     if ($loadResult.ClassMarkersFound) {
         $pending = [PSObjectJsonConverter]::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
         $loadResult['PendingClassNodes'] = $pending
@@ -1733,11 +1624,7 @@ if (-not ('TxTickGenerator' -as [type])) {
     return $loadResult
 } # End of LoadAsyncScriptBlock
 
-# Async class rehydration composite: the '~C' per-node loop runs in a background runspace on the pool.
-# The TYPE MAP is built by the load event action on the main session thread (user classes are only
-# resolvable there) and passed in as an argument; Type objects are process-wide, so the C# monolith can
-# instantiate them from this thread. The PS scriptblock fallback is intentionally NOT passed: it needs
-# main-session type resolution and would execute main-session state on this thread.
+# Async '~C' rehydration in a background runspace. The type map is built on the main thread (user classes resolve only there); the PS fallback is NOT passed - it needs main-session state.
  $Script:HashtableDB1Class_RehydrateAsyncScriptBlock = {
     param(
         [object] $thisObj,
@@ -1797,15 +1684,15 @@ Class HashTableDB1 {
     $DatabaseParamsHT = @{}
     # Name of files database
     $DatabaseFileName = "HashTableDB"
-    # Storage format: 'Json' (default - fast, readable, type-fidelity markers) or 'Xml' (CLIXML compatibility
-    # mode). After loading files of the other format the database is automatically resaved in the configured
-    # format and the old-format files are archived to OLD\, so the folder always holds a single format.
+    # 'Json' (default) or 'Xml'; the other format is auto-migrated on load and archived to OLD\
     [string] $StorageFormat = 'Json'
     $DatabaseFolderPath = ".\"
     $ErrorLevel = $null
     $ErrorText = $null
-    # Save this number of database backupds in OLD folder
+    # Save this number of database backups in OLD folder
     $NumOfDbBackupsToKeep = 0
+    # Compaction floor: pending changes must exceed BOTH this count and 30% of main
+    [int] $MinChangesToCompact = 1000
     $CurrentBackupNumber = 0
     # Add this read permissions to database. Example @("S-1-2-0") local users. Array
     $DatabaseReadAccessControlListIdentifiers = $null
@@ -1819,27 +1706,19 @@ Class HashTableDB1 {
     [bool]   $EnableTransactionLog           = $false
     # Number of days to keep TXLogs
     [int]    $TxLogRetentionDays   = 3
-    # Key -> Tuple(tick, op, value) of the LAST registered operation, captured at op time. Lock-free:
-    # a plain CD overwrite is last-write-wins per key - exactly what the delta-state txlog format
-    # stores. Memory is bounded by distinct keys and trimmed after every successful txlog write; the
-    # map doubles as LWW bookkeeping for future replay/sync conflict resolution.
+    # Key -> last op Tuple(tick, op, value), captured at op time; LWW per key, doubles as replay/sync bookkeeping
     [System.Collections.Concurrent.ConcurrentDictionary[string, object]] $KeyToTx = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    # Monotonic tick source (TxTickGenerator from the Add-Type block; typed [object] because class
-    # members bind type literals at compile time, before Add-Type executes). Created in the ctor.
+    # [object]-typed: class members bind type literals at compile time, before Add-Type
     hidden [object] $TxTickGenerator = $null
-    # Serializes sync + async invocations of the TxLog save scriptblock: the sync path is invisible
-    # to the async state container's WaitFor, so the lock is the only mutual-exclusion point
+    # Only mutual-exclusion point for sync + async TxLog saves
     hidden [object] $TxLogSaveLock = [object]::new()
     # Tick of the latest entry that has already been persisted to a TxLog file
     [long]   $LastTransactionLogSavedTimestamp  = 0
     # Last tick point written to a TxLog file
     [long]   $LastTxLogTick        = 0
-    # Watermark: all ops with tick <= this value are reflected in the saved DB files (persisted as
-    # ___DBSTATEASTOFTICK___ inside the deletes file, restored on load). Replay/sync must apply only
-    # entries with a newer tick
+    # Watermark persisted as ___DBSTATEASTOFTICK___ in the deletes file; replay/sync applies only newer ticks
     [long]   $DbStateAsOfTick      = 0
-    # Opt-in fsync of a txlog file before it becomes visible (recovery-critical deployments; costs
-    # an I/O stall per write). Off by default - pure sync usage does not need it
+    # Opt-in fsync before visibility; off by default
     [bool]   $TxLogFlushToDisk     = $false
     # Max lock file wait time (seconds)
     [int] $LockFileMaxWaitTime = 30
@@ -1874,28 +1753,21 @@ Class HashTableDB1 {
         $this.UpdatesFileLoadedDT = $null
         $this.RemovedFileLoadedDT = $null
         $this.DatabaseParamsHT = @{}
-        # TxLog state reset (the load and compact paths do the same): an empty DB has no pending ops
-        # and no persisted watermark. The generator watermark is NOT reset - it stays process-monotonic
+        # Generator watermark intentionally NOT reset (process-monotonic)
         $this.KeyToTx.Clear()
         $this.LastTransactionLogSavedTimestamp = 0
         $this.DbStateAsOfTick = 0
     }
-    # Registers the LAST operation for a key in the lock-free per-key op map. Shared by Add / Remove /
-    # UpsertNestedHashTableKey / RemoveNestedHashTableKey. The EnableTransactionLog guard stays at each
-    # call site: moving it inside would add a method call to every hot-path write even when TxLog is
-    # disabled. The value is captured HERE, at op time, so txlog entries are exact replay records (no
-    # phantom nulls from later concurrent removes). MUST be called AFTER the state writes
-    # (UpdatesHT/MergedHT/RemovedHT): the save path reads the generator watermark as the state
-    # watermark and relies on state-before-tick ordering. Closed generic Tuple type: keeps the record
-    # shape stable for the C# helpers regardless of the value's runtime type.
+    # Registers the last op for a key; the EnableTransactionLog guard stays at call sites (hot path). MUST run AFTER the state writes: the save path relies on state-before-tick ordering.
     hidden [void] RegisterTxOp([string]$keyName, [string]$op, [object]$value) {
         $nowTick = $this.TxTickGenerator.Next()
         $this.KeyToTx[$keyName] = [System.Tuple[long,string,object]]::new($nowTick, $op, $value)
     }
     # Adds record to a database
     [void] Add($KeyName, $HashValue) {
-        $this.UpdatesHT[$KeyName] = $HashValue
+        # MergedHT BEFORE UpdatesHT (same order as Remove/Upsert): a write racing CompactDatabase must not be lost in the tracker swap
         $this.MergedHT[$KeyName] = $HashValue
+        $this.UpdatesHT[$KeyName] = $HashValue
         $null = $this.RemovedHT.TryRemove($KeyName, [ref]$null)
         # TxLog entries - store operation type "A" with the value captured at op time
         if ($this.EnableTransactionLog) {
@@ -1940,7 +1812,7 @@ Class HashTableDB1 {
                 foreach ($k in $currentValue.Keys) { $newValue[$k] = $currentValue[$k] }
                 $newValue[$SecondaryKey] = $SecondaryKeyValue
             }
-            # CAS: only update if value hasn't changed since we read it. Third arg must be the ORIGINAL value, NOT $null (which would never match a non-null current value).
+            # CAS comparison value must be the ORIGINAL, not $null
             if ($this.MergedHT.TryUpdate($KeyName, $newValue, $originalValue)) {
                 $this.UpdatesHT[$KeyName] = $newValue
                 $null = $this.RemovedHT.TryRemove($KeyName, [ref]$null)
@@ -1952,7 +1824,7 @@ Class HashTableDB1 {
         if (-not $updated) {
             throw "Failed to update key '$KeyName' after 100 retries due to concurrent modifications."
         }
-        # TxLog entry if enabled - the applied nested hashtable snapshot is the captured value
+        # Captured value = the applied nested snapshot
         if ($this.EnableTransactionLog) {
             $this.RegisterTxOp($KeyName, 'A', $newValue)
         }
@@ -1994,8 +1866,7 @@ Class HashTableDB1 {
             $this.RegisterTxOp($KeyName, 'A', $newVal)
         }
     }
-    # Gets record from database. TryGetValue instead of the raw indexer: the indexer throws
-    # KeyNotFoundException on a missing key and PowerShell exception handling is expensive in hot read paths
+    # TryGetValue: the raw indexer throws on a missing key, and PS exception handling is expensive in hot paths
     [object] Get($KeyName) {
         if ($null -eq $KeyName) { return $null }
         $value = $null
@@ -2023,9 +1894,7 @@ Class HashTableDB1 {
         return ($this.UpdatesHT.Count + $this.RemovedHT.Count)
     }
     [hashtable] Clone() {
-        # Runtime type resolution: class method bodies bind type literals at compile time (before
-        # Add-Type at the top of this file executes), so a direct [PSObjectJsonConverter] reference
-        # here would break dot-sourcing in a fresh session
+        # Runtime '-as [type]': class bodies bind type literals at compile time, before Add-Type
         $converterType = 'PSObjectJsonConverter' -as [type]
         if ($converterType) { return $converterType::BuildHashtable($this.MergedHT) }
         # Fallback for the unlikely case the converter type is not loaded
@@ -2036,32 +1905,42 @@ Class HashTableDB1 {
     # Consolidate changes to a main database and creates new updates database - thus saving full DB
     [void] CompactDatabase() {
         $dateTimeNow = [System.Datetime]::Now
-        # Atomically swap references. MergedHT becomes MainHT. Concurrent writes to MergedHT are preserved and will be saved to main.json directly.
-        $this.MainHT = $this.MergedHT
-        # Replace UpdatesHT and RemovedHT with empty instances to reset change tracking. This avoids the race condition where concurrent writes to the old UpdatesHT could be lost during copy.
+        # Replace trackers FIRST: writes racing the MainHT copy below still reach the new updates tracker
         $this.UpdatesHT = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $this.RemovedHT = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # MainHT must be a SEPARATE copy of MergedHT: aliasing them made the 30% compaction threshold compare against the live merged count, so it could never fire and main.json went stale.
+        $converterType = 'PSObjectJsonConverter' -as [type]
+        if ($converterType) {
+            $this.MainHT = $converterType::BuildConcurrentDictionary($this.MergedHT, $null)
+        } else {
+            # Fallback for the unlikely case the converter type is not loaded (same pattern as Clone)
+            $mainCopy = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($k in $this.MergedHT.Keys) { $mainCopy[$k] = $this.MergedHT[$k] }
+            $this.MainHT = $mainCopy
+        }
         $this.MainFileLoadedDT = $dateTimeNow
         $this.UpdatesFileLoadedDT = $dateTimeNow
         $this.RemovedFileLoadedDT = $dateTimeNow
         $this.IsForceSaveMain = $true
-        # Clear TxLog state: full state is now in MainHT and the following save persists it together
-        # with a fresh ___DBSTATEASTOFTICK___ watermark. The cutoff is kept - new ticks are strictly
-        # above it, so the txlog file chain continues without a gap. Unconditional: a later
-        # EnableTransactionLog must not see pre-compact leftovers
+        # Cutoff is kept (new ticks stay above it, no txlog gap); the map is cleared unconditionally
         $this.KeyToTx.Clear()
     }
-    # Shared save prologue for SaveToDisk/SaveToDiskAsync: resets error state, waits out the previous
-    # async save BEFORE Compact (its finally-block resets the IsForceSaveMain flag that Compact sets),
-    # compacts when pending changes exceed 30% of main, and forces a main rewrite when the file is missing.
+    # Shared save prologue: reset errors, wait out the previous async save (before Compact resets its flags), compact, force main rewrite if the file is missing
     hidden [void] PrepareSave() {
         $this.ErrorLevel = $null
         $this.ErrorText  = $null
         $mainExt = 'json'
         if ($this.StorageFormat -eq 'Xml') { $mainExt = 'xml' }
         $mainPath = "$(Join-Path $this.DatabaseFolderPath $this.DatabaseFileName)_main.$mainExt"
+        # Wait out an in-flight load BEFORE snapshotting: Phase 2 swaps containers field-by-field, and a snapshot between swaps mixes old/new state. Raw wait (not the full WaitFor): the event job is still Running during the migration save from inside the load event action.
+        $loadState = $this.AsynchronousLoadOperationState
+        if ($loadState.BeginInvokeResult -and -not $loadState.BeginInvokeResult.IsCompleted) {
+            $null = $loadState.BeginInvokeResult.AsyncWaitHandle.WaitOne([System.TimeSpan]::FromSeconds($this.LockFileMaxWaitTime))
+        }
         $this.WaitForAsyncSaveToDisk()
-        if ($this.MainHT.Count * 0.3 -lt $this.GetPendingChangesCount()) {
+        # Compact needs both thresholds (see MinChangesToCompact)
+        $pendingChanges = $this.GetPendingChangesCount()
+        if (($pendingChanges -ge $this.MinChangesToCompact) -and ($this.MainHT.Count * 0.3 -lt $pendingChanges)) {
             $this.CompactDatabase()
         }
         if (-not [System.IO.File]::Exists($mainPath)) { $this.IsForceSaveMain = $true }
@@ -2101,10 +1980,7 @@ Class HashTableDB1 {
             }
         }
     }
-    # Shared wait/check core for all async operations. The four WaitFor* wrappers pass their state
-    # container, display name, warning-code prefix and error-source label; the bounded wait loop with
-    # progress dots, the timeout kill, the previous-job state check and the completed-reference cleanup
-    # live here ONCE instead of being copy-pasted four times.
+    # Shared bounded-wait core for the four WaitFor* wrappers
     hidden [void] WaitForAsyncOperationCore([AsyncContainer]$State, [string]$OpName, [string]$CodePrefix, [string]$ErrSource) {
         if ($State.BeginInvokeResult -and -not $State.BeginInvokeResult.IsCompleted) {
             $maxWait = [System.TimeSpan]::FromSeconds($this.LockFileMaxWaitTime)
@@ -2120,9 +1996,7 @@ Class HashTableDB1 {
                     if (([datetime]::Now - $start) -gt $maxWait) {
                         Write-Host ""
                         Write-Warning "$($CodePrefix)1. Async operation has exceeded allowed time. Stopping background process."
-                        # 1. Unregister the event so its Action won't try to wait for EndInvoke() and hang
-                        # 2. Asynchronously send a stop command (does not block the thread)
-                        # 3. Force-kill the RunspacePool - this destroys a zombie thread
+                        # Unregister event, async stop, kill the pool (zombie thread)
                         try {
                             if ($State.PSEventJob -and $State.PSEventJob.Name) {
                                 Unregister-Event -SourceIdentifier $State.PSEventJob.Name -ErrorAction SilentlyContinue
@@ -2155,14 +2029,13 @@ Class HashTableDB1 {
             }
         }
         $this.CheckPreviousEventJob($State, $CodePrefix, $ErrSource)
-        # FIXED Double Dispose: Avoid manual disposal here to prevent race conditions with Register-ObjectEvent Action.
+        # No manual disposal here - it races with the Register-ObjectEvent Action
         if ($State.BeginInvokeResult -and $State.BeginInvokeResult.IsCompleted) {
             $State.PSInstance = $null
             $State.PsEventJob = $null
         }
     }
-    # Shared previous-job state check: used by the wait core and by the *Async launchers
-    # (the launcher re-checks after pool setup - the job may have completed meanwhile).
+    # Bad previous-job states; launchers re-check after pool setup (the job may have completed meanwhile)
     hidden [void] CheckPreviousEventJob([AsyncContainer]$State, [string]$CodePrefix, [string]$ErrSource) {
         if ($State.PSEventJob -and $State.PSEventJob.State -in $this.BadEventJobStates) {
             Write-Warning "WARNING! $($CodePrefix)2. Bad previous PSEventJob state = $($State.PSEventJob.State)."
@@ -2177,8 +2050,7 @@ Class HashTableDB1 {
     }
     # Wait for previous async to finish
     [void] WaitForAsyncSaveToDisk() {
-        # A pending background rehydration must complete first: saving a snapshot mid-rehydrate would
-        # persist not-yet-rehydrated values as plain hashtables (losing their '~C' class markers)
+        # Rehydrate first: saving mid-rehydrate would persist raw hashtables, losing '~C' markers
         $this.WaitForAsyncRehydrate()
         $this.WaitForAsyncOperationCore($this.AsynchronousSaveOperationState, 'SaveToXMLAsync', 'WFASTX', 'AsyncSave')
     }
@@ -2199,7 +2071,7 @@ Class HashTableDB1 {
             $this.AsynchronousSaveOperationState.PSInstance = [PowerShell]::Create()
             $this.AsynchronousSaveOperationState.PSInstance.RunspacePool = $poolSaveToXMLAsync
             $null = $this.AsyncResults.Clear()
-            # Pass references: snapshots are not cloned because CompactDatabase() swaps whole CD instances atomically.
+            # References, not clones (see PrepareSave)
             $null = $this.AsynchronousSaveOperationState.PSInstance.AddScript($Script:HashtableDB1Class_SaveScriptBlock).AddArgument($this).AddArgument($this.MainHT).AddArgument($this.UpdatesHT).AddArgument($this.RemovedHT)
             $asyncResult = $this.AsynchronousSaveOperationState.PSInstance.BeginInvoke()
             $msgData = @{
@@ -2212,8 +2084,7 @@ Class HashTableDB1 {
                     $msgData = $Event.MessageData
                     $localAsyncResult = $msgData.AsyncResult
                     $thisObj = $msgData.thisObj
-                    # Same terminal-state guard as the load action: EndInvoke() is blocking, so handling the
-                    # Running transition would freeze the main thread for the whole save duration.
+                    # Terminal states only: EndInvoke() is blocking
                     $invState = $event.SourceEventArgs.InvocationStateInfo.State
                     if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                     try {
@@ -2309,8 +2180,7 @@ Class HashTableDB1 {
                     $localPSInstance = $event.Sender
                     $iar    = $event.MessageData.AsyncResult
                     $thisObj = $event.MessageData.thisObject
-                    # Same terminal-state guard as the load action: EndInvoke() is blocking, so handling the
-                    # Running transition would freeze the main thread for the whole TxLog save duration.
+                    # Terminal states only: EndInvoke() is blocking
                     $invState = $event.SourceEventArgs.InvocationStateInfo.State
                     if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                     try {
@@ -2333,6 +2203,8 @@ Class HashTableDB1 {
         $this.ErrorLevel = $null
         $this.ErrorText = $null
         $this.WaitForAsyncLoadFromDisk()
+        # Wait out an in-flight async save before reading: the save renames main/updates/deletes files one by one, and reading mid-swap would mix the new main with old updates (torn inconsistent state)
+        $this.WaitForAsyncSaveToDisk()
         try {
             # Direct invocation of the shared load script block
             $loadResult = & $Script:HashtableDB1Class_LoadScriptBlock $this
@@ -2357,10 +2229,7 @@ Class HashTableDB1 {
             # Runtime type resolution for dictionary builders (kept from the previous optimization)
             $converterType = 'PSObjectJsonConverter' -as [type]
             if (-not $converterType) { throw "PSObjectJsonConverter type is not loaded. Add-Type failed or was skipped." }
-            # Build all CDs as local variables, then assign atomically to prevent concurrent readers from seeing
-            # partially populated collections. C# helpers replace the slow PowerShell copy loops.
-            # NOTE: the converter type must be resolved at runtime ('-as [type]') - class method bodies
-            # bind type literals at compile time, before Add-Type at the top of this file has executed.
+            # Build locally, assign atomically (no partially populated collections for readers)
             if ($null -ne $loadResult.MainHT) {
                 $this.MainHT = $converterType::BuildConcurrentDictionary($loadResult.MainHT, $null)
             }
@@ -2371,31 +2240,34 @@ Class HashTableDB1 {
                 # Do not load the internal DB params marker into the live RemovedHT
                 $this.RemovedHT = $converterType::BuildConcurrentDictionary($loadResult.RemovedHT, "___DATABASEPARAMS___")
                 $this.DatabaseParamsHT = $loadResult.DatabaseParamsHT
-            } else {
-                $this.DatabaseParamsHT = @{ }
             }
+            # else (deletes not reloaded): PRESERVE live DatabaseParamsHT - resetting on a partial load would persist empty params
             $this.MainFileLoadedDT = $loadResult.MainFileLoadedDT
             $this.UpdatesFileLoadedDT = $loadResult.UpdatesFileLoadedDT
             $this.RemovedFileLoadedDT = $loadResult.RemovedFileLoadedDT
-            # Restore the state watermark and keep future ticks strictly above it: a machine with a
-            # lagging clock must not issue ticks below the loaded state (LWW/sync correctness)
-            $this.DbStateAsOfTick = $loadResult.DbStateAsOfTick
-            $this.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
-            # Rebuild merged hashtable, then assign atomically (C# helper - fast).
-            # $converterType was resolved above at runtime for the same compile-time binding reason.
+            # Guarded by the deletes reload: the watermark travels only in the deletes file (default 0), so an unconditional assign on a partial load would reset it and re-apply persisted entries. Bootstrap(0) never lowers the generator watermark.
+            if ($null -ne $loadResult.RemovedHT) {
+                $this.DbStateAsOfTick = $loadResult.DbStateAsOfTick
+                $this.TxTickGenerator.Bootstrap($loadResult.DbStateAsOfTick)
+            }
+            # Rebuild merged, assign atomically
             $this.MergedHT = $converterType::BuildMergedDictionary($this.MainHT, $this.UpdatesHT, $this.RemovedHT)
-            # Clear TxLog in-memory state since DB state is fully replaced by loaded data (unconditional:
-            # a later EnableTransactionLog must not see pre-load leftovers)
-            $this.KeyToTx.Clear()
+            # Keep a TxLog record only when its effect survived ('A' in UpdatesHT, 'R' in RemovedHT); replacing a component from disk discards its records. An unconditional Clear() would drop still-live records.
+            if (($null -ne $loadResult.UpdatesHT) -or ($null -ne $loadResult.RemovedHT)) {
+                $keepUpdatesEffects = ($null -eq $loadResult.UpdatesHT)
+                $keepRemovedEffects = ($null -eq $loadResult.RemovedHT)
+                $staleTxKeys = [System.Collections.Generic.List[string]]::new()
+                foreach ($txEntry in $this.KeyToTx) {
+                    $txRec = $txEntry.Value -as [System.Tuple[long,string,object]]
+                    if (-not $txRec) { continue }
+                    if (($txRec.Item2 -eq 'A') -and (-not $keepUpdatesEffects)) { $null = $staleTxKeys.Add($txEntry.Key) }
+                    elseif (($txRec.Item2 -eq 'R') -and (-not $keepRemovedEffects)) { $null = $staleTxKeys.Add($txEntry.Key) }
+                }
+                foreach ($staleTxKey in $staleTxKeys) { $null = $this.KeyToTx.TryRemove($staleTxKey, [ref]$null) }
+            }
+            # Safe: the map holds only never-persisted entries, so 0 re-collects the survivors
             $this.LastTransactionLogSavedTimestamp = 0
-            # Restore PS class instances ('~C' markers) only when the converter detected class markers in the
-            # loaded files - the main load-time optimization for class-free datasets. Runs AFTER the live
-            # dictionaries are published and uses the same batch pipeline as the async path:
-            # CollectUniqueClassNames resolves each UNIQUE class name once (user classes resolve only in this
-            # session), then RehydratePendingNodes rehydrates all nodes in one native pass with per-type
-            # reflection caches - depth-1 slots are patched straight into the live dictionaries, nested
-            # containers are patched in place (shared by reference with the raw tree). The PS TryRehydrate
-            # scriptblock is the fallback for types without a parameterless constructor.
+            # '~C' rehydration only when markers were detected (class-free datasets skip it entirely). Same batch pipeline as the async path; TryRehydrate is the ctor-less fallback.
             if ($loadResult.ClassMarkersFound) {
                 $pendingNodes = $converterType::CollectClassNodes(@($loadResult.MainHT, $loadResult.UpdatesHT, $loadResult.DatabaseParamsHT))
                 if ($pendingNodes -and $pendingNodes.Count -gt 0) {
@@ -2411,8 +2283,7 @@ Class HashTableDB1 {
                     }
                 }
             }
-            # Cross-format migration: loaded files differ from the class StorageFormat - resave in the
-            # current format; the save path archives the old-format files so the folder always holds one format
+            # Cross-format migration: resave in the configured format
             if ($loadResult.LoadedFormat -and ($loadResult.LoadedFormat -ne $this.StorageFormat)) {
                 $this.SaveToDisk()
             }
@@ -2437,6 +2308,8 @@ Class HashTableDB1 {
     # Asynchronous load from XML files. Usually used for preloading large databases in background
     [void] LoadFromDiskAsync() {
         $this.ErrorLevel = $null; $this.ErrorText = $null; $this.WaitForAsyncLoadFromDisk()
+        # Wait out an in-flight async save before Phase 1 starts reading: the save renames main/updates/deletes files one by one, and reading mid-swap would mix the new main with old updates (torn inconsistent state)
+        $this.WaitForAsyncSaveToDisk()
         $PSInstance =$null
         # Runspace for async loading
         if (-Not $this.AsynchronousLoadOperationState.Pool -or $this.AsynchronousLoadOperationState.Pool.IsDisposed) {
@@ -2447,9 +2320,7 @@ Class HashTableDB1 {
             # Reusing the same pool every time
             $poolLoadFromDiskAsync = $this.AsynchronousLoadOperationState.Pool
         }
-        # Checking previous job event after pool setup (the job may have completed meanwhile).
-        # The tail null-out was dropped: WaitForAsyncLoadFromDisk at method start already performed it.
-        # Note: unified numbering - the old LFXMLASNC1/2/3 became LFXMLASNC2/3/4.
+        # Re-check after pool setup (the job may have completed meanwhile)
         $this.CheckPreviousEventJob($this.AsynchronousLoadOperationState, 'LFXMLASNC', 'AsyncLoad')
         try {
             $PSInstance = [PowerShell]::Create()
@@ -2457,7 +2328,6 @@ Class HashTableDB1 {
             $null = $this.AsyncResults.Clear()
             $null = $PSInstance.AddScript($Script:HashtableDB1Class_LoadAsyncScriptBlock).AddArgument($this).AddArgument($Script:HashtableDB1Class_LoadScriptBlock)
             $asyncResult = $PSInstance.BeginInvoke()
-            # Assign PSInstance AFTER BeginInvoke succeeds so we don't leak a reference on throw
             $this.AsynchronousLoadOperationState.PSInstance = $PSInstance
             $msgData = @{
                 thisObj = $this
@@ -2468,14 +2338,10 @@ Class HashTableDB1 {
                 $messageData = $event.MessageData
                 $thisObj = $messageData.thisObj
                 $asyncResult = $messageData.asyncResult
-                # InvocationStateChanged fires on EVERY state transition (NotStarted -> Running -> Completed/Failed).
-                # This action runs on the MAIN thread and EndInvoke() is a BLOCKING call: handling the Running
-                # transition froze the main thread for the entire background load duration, and the action then ran
-                # a second time on Completed (double post-processing). Handle terminal states only.
+                # Terminal states only: this action runs on the MAIN thread and EndInvoke() is blocking
                 $invState = $event.SourceEventArgs.InvocationStateInfo.State
                 if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                 try {
-                    # End the invocation properly. Guard against empty output array if scriptblock threw before return.
                     $loadResultArray = $PSInstance.EndInvoke($asyncResult)
                     if (-not $loadResultArray -or $loadResultArray.Count -eq 0) {
                         $thisObj.AsyncResults['Success'] = $false
@@ -2487,12 +2353,7 @@ Class HashTableDB1 {
                     }
                     $loadResult = $loadResultArray[0]
                     if ($loadResult.Success -and $loadResult.DataIsLoaded) {
-                        # '~C' nodes: resolve class TYPES here, on the main session thread (user classes are
-                        # only resolvable in this context) - ONCE PER UNIQUE CLASS NAME, not once per node.
-                        # The per-node rehydration runs in a BACKGROUND runspace (RehydratePendingAsync):
-                        # executing the loop inside this action froze the main thread for the whole
-                        # rehydration phase (measured: 60269 nodes = 10.0 sec). Type objects are
-                        # process-wide, so the background op can instantiate them from its own thread.
+                        # Resolve class TYPES once per unique name here (user classes resolve only on the main thread); rehydration itself runs in a background runspace - running it inline froze the main thread
                         $pendingNodes = $loadResult.PendingClassNodes
                         if ($pendingNodes -and $pendingNodes.Count -gt 0) {
                             $converterType = 'PSObjectJsonConverter' -as [type]
@@ -2508,19 +2369,11 @@ Class HashTableDB1 {
                                 }
                             }
                         }
-                        # All ConcurrentDictionaries, timestamps, DatabaseParamsHT, MergedHT and TxLog state
-                        # were already built and published by the background runspace (Phase 2). Rehydration
-                        # patches are applied by the background rehydrate op: depth-1 slots go straight into
-                        # the live CDs, nested containers are patched in place (shared by reference with
-                        # Phase 2). This keeps the main-thread event action lightweight - no multi-second
-                        # freeze on large datasets.
+                        # Everything was already published by Phase 2; keep this action lightweight
                         $thisObj.AsyncResults['Success'] = $true
                         $thisObj.AsyncResults['Message'] = "Database $($thisObj.DatabaseFileName) loaded Asynchronously in $( [math]::Round($loadResult.LoadTime,3)) sec."
                         $thisObj.ErrorLevel = 0
-                        # Cross-format migration: loaded files differ from StorageFormat - start an async
-                        # resave; the save path archives the old-format files so the folder holds one format.
-                        # SaveToDiskAsync clears AsyncResults and repopulates them on completion, so a waiter
-                        # blocks until the migration save has finished.
+                        # Cross-format migration via async resave; AsyncResults are repopulated on its completion
                         if ($loadResult.LoadedFormat -and ($loadResult.LoadedFormat -ne $thisObj.StorageFormat)) {
                             $thisObj.SaveToDiskAsync()
                         }
@@ -2562,13 +2415,11 @@ Class HashTableDB1 {
             }
         }
     }
-    # Launches background '~C' class rehydration. Called by the load event action after it resolves the
-    # class type map on the main session thread. Reuses the (now free) load pool to avoid cold runspace
-    # creation; falls back to a dedicated pool when the load pool is unavailable.
+    # Launches background '~C' rehydration; reuses the free load pool when possible
     hidden [void] RehydratePendingAsync([object]$loadResult, [object]$typeMap) {
         if (-not $this.AsynchronousRehydrateOperationState.Pool -or $this.AsynchronousRehydrateOperationState.Pool.IsDisposed) {
             if ($this.AsynchronousLoadOperationState.Pool -and -not $this.AsynchronousLoadOperationState.Pool.IsDisposed) {
-                # The load op has completed by now - its pool is free; share it (Dispose guards with IsDisposed)
+                # Load op has completed - share its pool
                 $this.AsynchronousRehydrateOperationState.Pool = $this.AsynchronousLoadOperationState.Pool
             } else {
                 $poolRehydrate = [runspacefactory]::CreateRunspacePool(1,1)
@@ -2590,14 +2441,12 @@ Class HashTableDB1 {
                     $psInst = $event.Sender
                     $thisObj = $event.MessageData.thisObj
                     $iar = $event.MessageData.asyncResult
-                    # Terminal-state guard (same as the other ops): EndInvoke is blocking, so handling
-                    # the Running transition would freeze the main thread.
+                    # Terminal states only: EndInvoke() is blocking
                     $invState = $event.SourceEventArgs.InvocationStateInfo.State
                     if ($invState -notin @([System.Management.Automation.PSInvocationState]::Completed, [System.Management.Automation.PSInvocationState]::Failed, [System.Management.Automation.PSInvocationState]::Stopped)) { return }
                     try {
                         $out = $psInst.EndInvoke($iar)
                         $rehydratedCount = if ($out -and $out.Count) { $out[0] } else { 0 }
-                        # Duration measured by the background scriptblock (Stopwatch) - replaces the removed console diagnostics
                         $rehydrateMs = $thisObj.AsyncResults['RehydrateDurationMs']
                         $thisObj.AsyncResults['Message'] = "$($thisObj.AsyncResults['Message']) Rehydrated $rehydratedCount class instances in background ($rehydrateMs ms)."
                     } catch {
@@ -2611,8 +2460,7 @@ Class HashTableDB1 {
         } catch {
             $this.ErrorLevel = "RHYD1"
             $this.ErrorText = "Failed to start async rehydrate: $($_.Exception.Message)"
-            # Warning instead of ErrorLevel-only: the load action overwrites ErrorLevel with 0 right
-            # after the launch, so the console warning is the surviving signal
+            # Warning: the load action overwrites ErrorLevel with 0 right after the launch
             Write-Warning "RHYD1. Failed to start async rehydrate: $($_.Exception.Message)"
             if ($this.AsynchronousRehydrateOperationState.PSInstance) {
                 try { $this.AsynchronousRehydrateOperationState.PSInstance.Dispose() } catch {}
@@ -2620,7 +2468,7 @@ Class HashTableDB1 {
             }
         }
     }
-    # Creates database folder if it doesn't exist and sets read permissions for specified SID or write if it is specified.
+    # Creates the folder and sets read (or read+write) ACL for the SID
     [void] EnsureDBFolderWithPermissions($SID, [bool]$AllowWrite = $false) {
         $this.ErrorLevel = $null
         $this.ErrorText = $null
@@ -2691,13 +2539,12 @@ Class HashTableDB1 {
     }
     # Disposes class object
     [void] Dispose() {
-        # Rehydrate first: a pending background rehydration still patches the dictionaries cleared below
+        # Rehydrate first: it still patches the dictionaries cleared below
         $this.WaitForAsyncRehydrate()
         $this.WaitForAsyncSaveToDisk()
         $this.WaitForPendingTransactionLogOperations()
         $this.WaitForAsyncLoadFromDisk()
-        # Unified cleanup of all four async operation containers (identical per-container steps).
-        # Rehydrate may share the load pool: the second dispose is guarded by IsDisposed.
+        # Rehydrate may share the load pool - dispose is IsDisposed-guarded
         foreach ($opState in @($this.AsynchronousSaveOperationState, $this.AsynchronousTransactionLogSaveState, $this.AsynchronousLoadOperationState, $this.AsynchronousRehydrateOperationState)) {
             if (-not $opState) { continue }
             if ($opState.PSEventJob -and $opState.PSEventJob.Name) {
